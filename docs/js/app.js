@@ -751,5 +751,13 @@ function init() {
 
 document.addEventListener("DOMContentLoaded", init);
 
+// register the service worker so updates propagate automatically (see sw.js).
+// Harmless if unsupported/blocked; the app works identically without it.
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("sw.js").catch(() => {});
+  });
+}
+
 // expose for a tiny in-page smoke test (see tests/smoke.html)
 window.__ncx = { state, redraw, X, openBuffer, onFilesChosen };

@@ -64,17 +64,25 @@ Everything the app needs (Plotly, the HDF5 reader, the PDF exporter) is vendored
 under `docs/vendor/`, so the site is self-contained and works offline once
 loaded — no CDN, no external requests.
 
-### After you push an update
+### Updates propagate automatically (service worker)
 
-Browsers cache the app's JavaScript, so after you push a change to Pages an
-already-open tab may keep running the old version. Do a **hard refresh** once
-to pick up the new code:
+A small **service worker** (`docs/sw.js`) makes updates appear on their own — no
+cache-clearing needed. The app code (HTML/JS/CSS) is fetched **network-first**,
+so an online browser always gets the latest version on the next reload; the
+large vendored libraries are served from cache (fast) and refreshed in the
+background. As a bonus, the app also works **offline** after the first visit.
 
-- Windows/Linux: **Ctrl + Shift + R** (or Ctrl + F5)
-- Mac: **Cmd + Shift + R**
+So after you push a change to Pages, users get it on their next reload. Two
+caveats:
 
-(A private/incognito window always loads the latest, since it starts with an
-empty cache — handy for confirming an update went live.)
+- The **very first** load after this service worker was added needs one manual
+  refresh (existing tabs are still on the pre-service-worker cache). After that
+  it's automatic.
+- If a tab was already open when you pushed, reload it to pick up the change. A
+  **hard refresh** (Ctrl/Cmd + Shift + R) forces it instantly, and a
+  private/incognito window always loads the latest — handy to confirm a deploy.
+
+To turn the service worker off, follow the note at the top of `docs/sw.js`.
 
 ## How it's built (for maintainers)
 
