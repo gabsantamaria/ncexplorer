@@ -5,6 +5,7 @@
 // absolute paths); on load the user re-picks any file that isn't already open.
 
 import { DEFAULT_PLOTCFG, PROJECT_FORMAT } from "./explore.js";
+import { CMAP_NAMES } from "./colormaps.js";
 
 export function buildProject(state) {
   return {
@@ -41,6 +42,10 @@ export function parseProject(text) {
   // canvas that hangs the tab; clamp to the same range the UI allows
   plotcfg.figw = Math.min(40, Math.max(2, Number.isFinite(plotcfg.figw) ? plotcfg.figw : DEFAULT_PLOTCFG.figw));
   plotcfg.figh = Math.min(40, Math.max(2, Number.isFinite(plotcfg.figh) ? plotcfg.figh : DEFAULT_PLOTCFG.figh));
+  // desktop projects use lowercase colormap names ("viridis"); map to the
+  // web app's canonical case so the widget and colorbar match
+  const canon = CMAP_NAMES.find((n) => n.toLowerCase() === String(plotcfg.cmap).toLowerCase());
+  plotcfg.cmap = canon || DEFAULT_PLOTCFG.cmap;
   return {
     plotcfg,
     files: Array.isArray(proj.files) ? proj.files.map(String) : [],

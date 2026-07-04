@@ -368,8 +368,11 @@ function redraw() {
           line: { color, width: 3 }, name, showlegend });
       } else {
         state.drawnMap.push({ ti: f.ti, j });
-        data.push({ type: "scattergl", mode: "lines", x: xs, y: ys,
-          line: { color, width: 1.5 }, name, showlegend, hoverinfo: "x+y+name" });
+        // SVG scatter keeps exports truly vector; only very large lines fall
+        // back to WebGL (scattergl) for rendering performance
+        data.push({ type: m > 20000 ? "scattergl" : "scatter", mode: "lines",
+          x: xs, y: ys, line: { color, width: 1.5 }, name, showlegend,
+          hoverinfo: "x+y+name" });
       }
     });
   }
@@ -593,16 +596,24 @@ async function loadProjectFile(file) {
   let proj;
   try { proj = parseProject(await file.text()); }
   catch (e) { status("Project load error: " + e.message); return; }
-  const missing = proj.files.filter((f) => !state.dsets.has(f));
+  // resolve each project file reference to an OPEN dataset by BASENAME: desktop
+  // projects store absolute paths, web projects store bare names — the browser
+  // keys open files by their bare filename, so match on that (case-insensitive)
+  const openByBase = new Map();
+  for (const nm of state.fileOrder) openByBase.set(basename(nm).toLowerCase(), nm);
+  const resolve = (f) => openByBase.get(basename(f).toLowerCase()) || null;
+  const missing = [...new Set(proj.files.map((f) => basename(f)))]
+    .filter((b) => !openByBase.has(b.toLowerCase()));
   if (missing.length) {
     status(`Project needs data file(s) not open: ${missing.join(", ")}. `
-      + "Open them (same file names) then load the project again.");
-    // still apply what we can
+      + "Open them first (drag the .nc in alongside the project), then reload.");
+    // still apply cosmetics + any traces whose file IS open
   }
   const projToNew = {};
   const newtraces = [];
   proj.traces.forEach((t, pi) => {
-    const ds = state.dsets.get(t.file);
+    const openName = resolve(t.file);
+    const ds = openName && state.dsets.get(openName);
     if (!ds || !ds.has(t.var)) return;
     const dims = ds.variable(t.var).dims;
     let ldim = String(t.line_dim || "");
@@ -616,7 +627,7 @@ async function loadProjectFile(file) {
         slices[k] = Math.max(0, v | 0);
       }
     projToNew[pi] = newtraces.length;
-    newtraces.push({ file: t.file, var: t.var, line_dim: ldim, sweep, slices,
+    newtraces.push({ file: openName, var: t.var, line_dim: ldim, sweep, slices,
       xsrc: String(t.xsrc || "index"), label: String(t.label || t.var),
       sweep_label: String(t.sweep_label || ""), visible: t.visible !== false });
   });
@@ -639,6 +650,7 @@ function addOpts(sel, items, current) {
   }
 }
 function esc(s) { return String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c])); }
+function basename(p) { return String(p).replace(/\\/g, "/").split("/").pop(); }
 // CSV field: neutralize spreadsheet formula injection (a cell beginning with
 // = + - @ or a control char is evaluated by Excel/Sheets), then quote
 function csvField(s) {
@@ -696,12 +708,15 @@ function init() {
   // drag & drop
   const dz = document.body;
   dz.addEventListener("dragover", (e) => { e.preventDefault(); });
-  dz.addEventListener("drop", (e) => {
+  dz.addEventListener("drop", async (e) => {
     e.preventDefault();
-    const ncproj = [...e.dataTransfer.files].filter((f) => f.name.endsWith(".ncproj"));
-    const ncs = [...e.dataTransfer.files].filter((f) => !f.name.endsWith(".ncproj"));
-    if (ncs.length) onFilesChosen(ncs);
-    if (ncproj.length) loadProjectFile(ncproj[0]);
+    const all = [...e.dataTransfer.files];
+    const ncproj = all.filter((f) => /\.(ncproj|json)$/i.test(f.name));
+    const ncs = all.filter((f) => !/\.(ncproj|json)$/i.test(f.name));
+    // open the data files FIRST (await) so a project dropped alongside them
+    // resolves against the now-open datasets
+    if (ncs.length) await onFilesChosen(ncs);
+    if (ncproj.length) await loadProjectFile(ncproj[0]);
   });
 
   Plotly.newPlot(gd(), [], { margin: { t: 20 } }, { displaylogo: false, responsive: true });

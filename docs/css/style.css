@@ -12,6 +12,7 @@ header {
   background: #25303f; color: #fff; padding: 8px 16px; display: flex;
   align-items: baseline; gap: 14px; flex: none;
 }
+header .logo { display: block; border-radius: 6px; flex: none; }
 header h1 { font-size: 17px; margin: 0; letter-spacing: .3px; }
 header .sub { color: #9fb4c8; font-size: 12px; }
 
