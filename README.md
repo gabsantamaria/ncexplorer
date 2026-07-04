@@ -28,7 +28,8 @@ browser. Nothing is sent anywhere.
   **right-click a tab → Duplicate** to fork a formatted plot and tweak the copy.
 - **Cosmetics** you can edit before export: title, axis labels, per-trace legend
   labels, **per-trace color**, per-line **sweep-label templates** (`T = {v} K`),
-  legend location, grid, log axes, colormap, and **SI unit scaling**
+  legend location, grid, log axes, colormap, optional **axis limits** (X/Y
+  min/max, per tab — set one side to fix just that end), and **SI unit scaling**
   (k/M/G/T/m/µ/n/p) on both axes (labels and CSV follow).
 - **Markers** that attach to trace data points and **follow the sliders** —
   left-click to add, right-click to delete.

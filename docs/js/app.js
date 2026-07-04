@@ -634,6 +634,10 @@ function redraw() {
   state.drawnMap = [];
   let firstX = null;
   let coloredNoLegend = false;    // sweep lines colored but with no legend entry
+  // data extents (in displayed units) so a one-sided axis limit can fill the
+  // other side from the data
+  let xDMin = Infinity, xDMax = -Infinity;
+  let yLMin = Infinity, yLMax = -Infinity, yRMin = Infinity, yRMax = -Infinity;
 
   const normFor = (f) => {
     if (!f.sweep) return null;
@@ -659,7 +663,15 @@ function redraw() {
     f.lines.forEach((ln, j) => {
       const m = Math.min(ln.x.length, ln.y.length);
       const xs = new Array(m), ys = new Array(m);
-      for (let k = 0; k < m; k++) { xs[k] = ln.x[k] / xf; ys[k] = ln.y[k] / yf; }
+      for (let k = 0; k < m; k++) {
+        const xv = ln.x[k] / xf, yv = ln.y[k] / yf;
+        xs[k] = xv; ys[k] = yv;
+        if (Number.isFinite(xv)) { if (xv < xDMin) xDMin = xv; if (xv > xDMax) xDMax = xv; }
+        if (Number.isFinite(yv)) {
+          if (onRight) { if (yv < yRMin) yRMin = yv; if (yv > yRMax) yRMax = yv; }
+          else { if (yv < yLMin) yLMin = yv; if (yv > yLMax) yLMax = yv; }
+        }
+      }
       if (firstX === null) firstX = xs;
       const sOk = ln.sval != null && Number.isFinite(ln.sval);
       const color = (sOk && nrm) ? cmapColor(c.cmap, (ln.sval - nrm.lo) / (nrm.hi - nrm.lo)) : base;
@@ -722,6 +734,8 @@ function redraw() {
       zaxis: { title: { text: ylab }, showgrid: c.grid },
     };
     if (c.logx || c.logy) notes.push("log axes are not applied in the 3D view");
+    if (c.xmin || c.xmax || c.ymin || c.ymax || c.ymin2 || c.ymax2)
+      notes.push("axis limits are applied in the 2D views only");
   } else {
     // a full box frame with visible axis lines and outward ticks
     const frame = { showline: true, linecolor: "#2a2a2a", linewidth: 1.2,
@@ -734,6 +748,16 @@ function redraw() {
       layout.yaxis2 = { title: { text: ylab2 }, overlaying: "y", side: "right",
         showgrid: false, zeroline: false, type: c.logy2 ? "log" : "linear",
         mirror: true, ...frame };
+    }
+    // optional per-tab axis limits (blank = auto); a one-sided limit fills the
+    // other end from the data extent
+    const xr = axisRange(c.xmin, c.xmax, xDMin, xDMax, c.logx);
+    if (xr) { layout.xaxis.range = xr; layout.xaxis.autorange = false; }
+    const yr = axisRange(c.ymin, c.ymax, yLMin, yLMax, c.logy);
+    if (yr) { layout.yaxis.range = yr; layout.yaxis.autorange = false; }
+    if (anyRight) {
+      const yr2 = axisRange(c.ymin2, c.ymax2, yRMin, yRMax, c.logy2);
+      if (yr2) { layout.yaxis2.range = yr2; layout.yaxis2.autorange = false; }
     }
   }
   if (c.lock_size) {
@@ -782,6 +806,26 @@ function drawMarkers(data, fetched, xf, yfFor, traceOnRight) {
       hoverinfo: "text", showlegend: false, cliponaxis: false,
     });
   }
+}
+
+// build a Plotly axis range from optional user min/max (strings; "" = auto),
+// filling an unset side from the data extent. Returns null to keep autorange.
+// For a log axis the range must be in log10 units (positive values only).
+function axisRange(umin, umax, dmin, dmax, isLog) {
+  const nmin = parseFloat(umin), nmax = parseFloat(umax);
+  const hasMin = Number.isFinite(nmin), hasMax = Number.isFinite(nmax);
+  if (!hasMin && !hasMax) return null;
+  let lo = hasMin ? nmin : dmin;
+  let hi = hasMax ? nmax : dmax;
+  if (!Number.isFinite(lo) || !Number.isFinite(hi)) return null;   // no data to fill the auto side
+  if (lo > hi) { const t = lo; lo = hi; hi = t; }                  // treat as bounds, keep min<max
+  if (lo === hi) { lo -= 0.5; hi += 0.5; }                         // avoid a zero-width axis
+  if (isLog) {
+    if (hi <= 0) return null;                                      // nothing positive to show
+    if (lo <= 0) lo = (Number.isFinite(dmin) && dmin > 0) ? dmin : hi / 1000;
+    return [Math.log10(lo), Math.log10(hi)];
+  }
+  return [lo, hi];
 }
 
 function legendLoc(loc) {
@@ -842,6 +886,9 @@ function cfgChanged() {
   c.ylabel2 = $("cfg_ylab2").value;
   c.yunit2 = $("cfg_yscale2").value === "—" ? "" : $("cfg_yscale2").value;
   c.logy2 = $("cfg_logy2").checked;
+  c.xmin = $("cfg_xmin").value; c.xmax = $("cfg_xmax").value;
+  c.ymin = $("cfg_ymin").value; c.ymax = $("cfg_ymax").value;
+  c.ymin2 = $("cfg_ymin2").value; c.ymax2 = $("cfg_ymax2").value;
   c.lock_size = $("cfg_lock").checked;
   c.figw = +$("cfg_figw").value; c.figh = +$("cfg_figh").value;
   $("cfg_figw").disabled = !c.lock_size; $("cfg_figh").disabled = !c.lock_size;
@@ -859,6 +906,9 @@ function applyCfgWidgets() {
   $("cfg_xscale").value = c.xunit || "—"; $("cfg_yscale").value = c.yunit || "—";
   $("cfg_ylab2").value = c.ylabel2 || ""; $("cfg_yscale2").value = c.yunit2 || "—";
   $("cfg_logy2").checked = !!c.logy2;
+  $("cfg_xmin").value = c.xmin || ""; $("cfg_xmax").value = c.xmax || "";
+  $("cfg_ymin").value = c.ymin || ""; $("cfg_ymax").value = c.ymax || "";
+  $("cfg_ymin2").value = c.ymin2 || ""; $("cfg_ymax2").value = c.ymax2 || "";
   $("cfg_lock").checked = c.lock_size; $("cfg_figw").value = c.figw; $("cfg_figh").value = c.figh;
   $("cfg_figw").disabled = !c.lock_size; $("cfg_figh").disabled = !c.lock_size;
   state._updating = false;
@@ -1195,6 +1245,7 @@ function init() {
   $("ed_autocolor").onchange = () => editorChanged("autocolor");
   ["cfg_mode", "cfg_title", "cfg_xlab", "cfg_ylab", "cfg_zlab", "cfg_legloc",
     "cfg_cmap", "cfg_xscale", "cfg_yscale", "cfg_ylab2", "cfg_yscale2",
+    "cfg_xmin", "cfg_xmax", "cfg_ymin", "cfg_ymax", "cfg_ymin2", "cfg_ymax2",
     "cfg_figw", "cfg_figh"].forEach((id) => {
     $(id).onchange = cfgChanged;
   });

@@ -73,11 +73,26 @@
         <label>Y ÷ <select id="cfg_yscale"></select></label>
       </div>
       <label>Colormap <select id="cfg_cmap"></select></label>
+      <div class="sub-h">Axis limits (blank = auto)</div>
+      <div class="row">
+        <label>X min <input id="cfg_xmin" type="number" step="any" placeholder="auto" /></label>
+        <label>X max <input id="cfg_xmax" type="number" step="any" placeholder="auto" /></label>
+      </div>
+      <div class="row">
+        <label>Y min <input id="cfg_ymin" type="number" step="any" placeholder="auto" /></label>
+        <label>Y max <input id="cfg_ymax" type="number" step="any" placeholder="auto" /></label>
+      </div>
+      <p class="hint">In displayed units (after any ÷ scaling). Set one side only to fix
+        just that end. 2D views only.</p>
       <div class="sub-h">Right Y axis (secondary)</div>
       <label>Right Y label <input id="cfg_ylab2" type="text" placeholder="auto" /></label>
       <div class="row wrap">
         <label>Right Y ÷ <select id="cfg_yscale2"></select></label>
         <label class="chk"><input id="cfg_logy2" type="checkbox" /> log</label>
+      </div>
+      <div class="row">
+        <label>Right Y min <input id="cfg_ymin2" type="number" step="any" placeholder="auto" /></label>
+        <label>Right Y max <input id="cfg_ymax2" type="number" step="any" placeholder="auto" /></label>
       </div>
       <p class="hint">assign a trace to the right axis in “Selected trace → Y axis”.</p>
     </section>
