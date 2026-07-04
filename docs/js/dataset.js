@@ -7,6 +7,8 @@ import { parseNetCDF3 } from "./netcdf3.js";
 import { parseHDF5 } from "./hdf5.js";
 
 export function openBuffer(buffer, filename) {
+  if (!buffer || buffer.byteLength < 4)
+    throw new Error("file is too small to be a NetCDF file");
   const u8 = new Uint8Array(buffer, 0, 4);
   if (u8[0] === 0x43 && u8[1] === 0x44 && u8[2] === 0x46)          // "CDF"
     return new Dataset(parseNetCDF3(buffer), filename);
@@ -29,6 +31,25 @@ export class Variable {
     this.dtype = v.dtype;
     this.isChar = !!v.isChar;
     this.data = v.data;                 // flat numeric array, or string / string[]
+    this._maskFill();
+  }
+  // apply CF/netCDF _FillValue / missing_value: sentinels -> NaN so they gap
+  // in the plot instead of being drawn as real data
+  _maskFill() {
+    if (this.isChar || typeof this.data === "string" || !this.data
+        || this.data.length === undefined) return;
+    const a = this.attrs || {};
+    const fills = [];
+    const push = (x) => { const n = Number(x); if (Number.isFinite(n)) fills.push(n); };
+    if (a._FillValue != null) [].concat(a._FillValue).forEach(push);
+    if (a.missing_value != null) [].concat(a.missing_value).forEach(push);
+    if (!fills.length) return;
+    const src = this.data;
+    const out = new Float64Array(src.length);   // int arrays can't hold NaN
+    const isFill = (x) => fills.some((fv) =>
+      x === fv || (Math.abs(fv) > 1e30 && Math.abs(x - fv) <= Math.abs(fv) * 1e-5));
+    for (let i = 0; i < src.length; i++) { const x = Number(src[i]); out[i] = isFill(x) ? NaN : x; }
+    this.data = out;
   }
   get ndim() { return this.dims.length; }
   get size() { return this.shape.reduce((a, b) => a * b, 1); }

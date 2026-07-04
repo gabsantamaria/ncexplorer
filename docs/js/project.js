@@ -30,12 +30,17 @@ export function parseProject(text) {
   if (proj.format !== PROJECT_FORMAT) throw new Error("not an NC Explorer project");
   const plotcfg = { ...DEFAULT_PLOTCFG };
   for (const [k, v] of Object.entries(proj.plot || {})) {
+    if (k === "__proto__" || k === "constructor" || k === "prototype") continue;
     if (!(k in plotcfg)) continue;
     const dv = DEFAULT_PLOTCFG[k];
     if (typeof dv === "boolean") { if (typeof v === "boolean") plotcfg[k] = v; }
     else if (typeof dv === "number") { if (typeof v === "number") plotcfg[k] = v; }
     else if (typeof v === typeof dv) plotcfg[k] = v;
   }
+  // a hostile/corrupt project could set a huge figw/figh -> a giant Plotly
+  // canvas that hangs the tab; clamp to the same range the UI allows
+  plotcfg.figw = Math.min(40, Math.max(2, Number.isFinite(plotcfg.figw) ? plotcfg.figw : DEFAULT_PLOTCFG.figw));
+  plotcfg.figh = Math.min(40, Math.max(2, Number.isFinite(plotcfg.figh) ? plotcfg.figh : DEFAULT_PLOTCFG.figh));
   return {
     plotcfg,
     files: Array.isArray(proj.files) ? proj.files.map(String) : [],

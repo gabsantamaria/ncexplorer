@@ -28,7 +28,7 @@ function status(msg) { $("status").textContent = msg; }
 // =====================================================================  files
 async function openFile(file) {
   const name = file.name;
-  if (state.dsets.has(name)) { status(`${name} is already open.`); return name; }
+  if (state.dsets.has(name)) return { name, reused: true };   // kept, not reloaded
   const buf = await file.arrayBuffer();
   let ds;
   try { ds = openBuffer(buf, name); }
@@ -36,15 +36,18 @@ async function openFile(file) {
   state.dsets.set(name, ds);
   state.fileOrder.push(name);
   rebuildTree();
-  return name;
+  return { name, reused: false };
 }
 
 async function onFilesChosen(fileList) {
-  const opened = [];
+  const opened = [], reused = [];
   for (const f of fileList) {
-    const nm = await openFile(f);
-    if (nm) opened.push(nm);
+    const r = await openFile(f);
+    if (!r) continue;
+    (r.reused ? reused : opened).push(r.name);
   }
+  const reusedNote = reused.length
+    ? `  (already open, not reloaded: ${reused.join(", ")})` : "";
   // auto-suggest lab-format traces only for a fresh session
   if (opened.length && state.traces.length === 0) {
     for (const nm of opened) {
@@ -54,11 +57,12 @@ async function onFilesChosen(fileList) {
     if (state.traces.length) {
       rebuildTraceList(state.traces.length - 1);
       redraw();
-      status(`Opened ${opened.join(", ")} — added default trace(s). Use the sliders to explore.`);
+      status(`Opened ${opened.join(", ")}${reusedNote} — added default trace(s). Use the sliders to explore.`);
       return;
     }
   }
-  status(`Opened ${opened.join(", ")}. Pick a variable and "Add trace".`);
+  const head = opened.length ? `Opened ${opened.join(", ")}.` : "No new files opened.";
+  status(`${head}${reusedNote} Pick a variable and "Add trace".`);
 }
 
 function closeFile(name) {
@@ -73,7 +77,12 @@ function closeFile(name) {
     .map((m) => ({ ...m, trace: remap[m.trace] }));
   state.traces = keep;
   rebuildTree();
-  rebuildTraceList(Math.min(state.cur, state.traces.length - 1));
+  // preserve the selected trace's identity when it survived; else clamp
+  const newCur = state.traces.length
+    ? (remap[state.cur] !== undefined ? remap[state.cur]
+       : Math.min(state.cur, state.traces.length - 1))
+    : -1;
+  rebuildTraceList(newCur);
   redraw();
 }
 
@@ -324,6 +333,7 @@ function redraw() {
   const data = [];
   state.drawnMap = [];
   let firstX = null;
+  let coloredNoLegend = false;    // sweep lines colored but with no legend entry
 
   const normFor = (f) => {
     if (!f.sweep) return null;
@@ -351,6 +361,7 @@ function redraw() {
       const color = (sOk && nrm) ? cmapColor(c.cmap, (ln.sval - nrm.lo) / (nrm.hi - nrm.lo)) : base;
       let name = null, showlegend = false;
       if (ln.sval === null || f.lines.length <= 12) { name = X.lineLabel(f.t, f.sweep, ln.sval, j); showlegend = c.legend; }
+      else if (sOk && nrm) coloredNoLegend = true;   // colored but unlabeled
       if (is3d) {
         const yy = new Array(m).fill(sOk ? ln.sval : f.ti);
         data.push({ type: "scatter3d", mode: "lines", x: xs, y: yy, z: ys,
@@ -363,8 +374,9 @@ function redraw() {
     });
   }
 
-  // shared colorbar (rainbow, single sweep quantity)
-  if (c.mode === "Rainbow" && sharedName) {
+  // shared colorbar: in Rainbow mode, or whenever a single-sweep family is
+  // colored in 2D but had its legend omitted (>12 lines) so colors stay mappable
+  if ((c.mode === "Rainbow" || (!is3d && coloredNoLegend)) && sharedName) {
     const [lo, hi] = ranges[sharedName];
     data.push({
       type: "scatter", x: [firstX ? firstX[0] : 0], y: [null], mode: "markers",
@@ -381,7 +393,7 @@ function redraw() {
   if (!is3d) drawMarkers(data, fetched, xf, yf);
   else if (state.markers.length) notes.push("markers are shown in the 2D views only");
 
-  const auto = X.autoLabels(state.dsets.get(fetched[0] ? fetched[0].t.file : ""), state.traces);
+  const auto = X.autoLabels(state.dsets, state.traces);
   const xlab = c.xlabel || X.scaledLabel(auto.xl || "", c.xunit);
   const ylab = c.ylabel || X.scaledLabel(auto.yl || "", c.yunit);
   const layout = {
@@ -404,8 +416,9 @@ function redraw() {
     layout.yaxis = { title: { text: ylab }, showgrid: c.grid, zeroline: false, type: c.logy ? "log" : "linear" };
   }
   if (c.lock_size) {
-    layout.width = Math.round(c.figw * PX_PER_IN);
-    layout.height = Math.round(c.figh * PX_PER_IN);
+    const clamp = (v, d) => Math.min(40, Math.max(2, Number.isFinite(v) ? v : d));
+    layout.width = Math.round(clamp(c.figw, 8) * PX_PER_IN);
+    layout.height = Math.round(clamp(c.figh, 5.2) * PX_PER_IN);
     layout.autosize = false;
   } else { layout.autosize = true; }
 
@@ -477,7 +490,9 @@ function onPlotContext(e) {
   const py = e.clientY - rect.top - g._fullLayout.margin.t;
   let best = -1, bd = 30 * 30;
   state._markerXY.forEach(({ mi, x, y }) => {
-    const dx = xa.l2p(x) - px, dy = ya.l2p(y) - py;
+    // c2p applies the axis transform (log10 on a log axis), so the hit-test
+    // is correct on both linear and log axes; c2p === l2p on linear
+    const dx = xa.c2p(x) - px, dy = ya.c2p(y) - py;
     const d = dx * dx + dy * dy;
     if (d < bd) { bd = d; best = mi; }
   });
@@ -554,7 +569,7 @@ function exportCSV() {
     const { lines } = X.traceLines(ds, t, status);
     for (const ln of lines) {
       const m = Math.min(ln.x.length, ln.y.length);
-      const lab = (t.label || t.var).replace(/"/g, '""');
+      const lab = csvField(t.label || t.var);
       const sv = ln.sval == null ? "" : X.fmt6(ln.sval);
       for (let k = 0; k < m; k++) rows.push(`"${lab}",${sv},${ln.x[k] / xf},${ln.y[k] / yf}`);
     }
@@ -594,9 +609,12 @@ async function loadProjectFile(file) {
     if (!dims.includes(ldim)) ldim = dims[dims.length - 1];
     let sweep = String(t.sweep || "");
     if (sweep && (!dims.includes(sweep) || sweep === ldim)) sweep = "";
-    const slices = {};
+    const slices = Object.create(null);
     if (t.slices && typeof t.slices === "object")
-      for (const [k, v] of Object.entries(t.slices)) slices[k] = Math.max(0, v | 0);
+      for (const [k, v] of Object.entries(t.slices)) {
+        if (k === "__proto__" || k === "constructor") continue;
+        slices[k] = Math.max(0, v | 0);
+      }
     projToNew[pi] = newtraces.length;
     newtraces.push({ file: t.file, var: t.var, line_dim: ldim, sweep, slices,
       xsrc: String(t.xsrc || "index"), label: String(t.label || t.var),
@@ -621,6 +639,13 @@ function addOpts(sel, items, current) {
   }
 }
 function esc(s) { return String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c])); }
+// CSV field: neutralize spreadsheet formula injection (a cell beginning with
+// = + - @ or a control char is evaluated by Excel/Sheets), then quote
+function csvField(s) {
+  let v = String(s);
+  if (/^[=+\-@\t\r]/.test(v)) v = "'" + v;
+  return v.replace(/"/g, '""');
+}
 function stamp() {
   const d = new Date(), p = (n) => String(n).padStart(2, "0");
   return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;

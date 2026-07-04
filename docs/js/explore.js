@@ -167,9 +167,12 @@ export function lineLabel(t, sweep, sval, j) {
   return `${base} [${sweep}=${fmt6(sval)}]`;
 }
 
-export function autoLabels(ds, traces) {
+// dsets: Map(file -> Dataset). Units are read from each trace's OWN file.
+export function autoLabels(dsets, traces) {
   for (const t of traces) {
-    if (!t.visible || !ds.has(t.var)) continue;
+    if (!t.visible) continue;
+    const ds = dsets && dsets.get && dsets.get(t.file);
+    if (!ds || !ds.has(t.var)) continue;
     const v = ds.variable(t.var);
     let yl = t.var;
     if (v.attrs.units) yl += ` (${v.attrs.units})`;

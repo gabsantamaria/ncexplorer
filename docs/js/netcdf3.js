@@ -95,7 +95,10 @@ class Reader {
       throw new Error("unsupported NetCDF version byte " + this.version);
     this.pos = 4;
     let numrecs = this._size();            // STREAMING (all-1s) handled below
-    if ((this.version !== 5 && numrecs === 0xffffffff)) numrecs = -1;
+    // streaming sentinel: 0xFFFFFFFF (CDF-1/2) or 0xFFFFFFFFFFFFFFFF (CDF-5,
+    // which narrows to this double when read via getBigUint64->Number)
+    if ((this.version !== 5 && numrecs === 0xffffffff)
+        || (this.version === 5 && numrecs >= 1.8446744073709552e19)) numrecs = -1;
 
     // dim_list
     const dims = [];
@@ -118,7 +121,13 @@ class Reader {
         const name = this._name();
         const ndims = this._size();
         const dimids = [];
-        for (let d = 0; d < ndims; d++) dimids.push(this._i32());
+        for (let d = 0; d < ndims; d++) {
+          const id = this._i32();
+          if (id < 0 || id >= dims.length)
+            throw new Error(`variable "${name}" references invalid dimension id `
+              + `${id} (file has ${dims.length} dimensions) — not a valid NetCDF file`);
+          dimids.push(id);
+        }
         const atts = this._attrList();
         const nctype = this._i32();
         const vsize = this._size();
@@ -140,6 +149,20 @@ class Reader {
     return this.header;
   }
 
+  // reject declared sizes that don't fit the actual buffer: a crafted header
+  // could otherwise declare billions of elements and hang/OOM the tab, and
+  // TypedArray.subarray clamps silently so this never throws on its own
+  _checkFits(v, total, bytes) {
+    if (!Number.isFinite(total) || total < 0)
+      throw new Error(`variable "${v.name}" has an invalid element count`);
+    const need = (v.record ? this.header.numrecs *
+        this.header.vars.filter((x) => x.record).reduce((s, x) => s + x.vsize, 0)
+      : total * bytes);
+    if (v.begin + need > this.dv.byteLength + 4)   // +4 tolerance for padding
+      throw new Error(`variable "${v.name}" declares ${total} elements but the `
+        + `file is too small (truncated or corrupt NetCDF)`);
+  }
+
   // materialize one variable's data as a flat JS Array (numbers) or string
   readVariable(v) {
     const t = NC_TYPE[v.nctype];
@@ -152,6 +175,7 @@ class Reader {
       return d.unlimited ? this.header.numrecs : d.length;
     });
     const total = shape.reduce((a, b) => a * b, 1);
+    this._checkFits(v, total, t.bytes);
     const out = new Float64Array(total);
     if (!v.record) {
       let off = v.begin;
@@ -178,6 +202,7 @@ class Reader {
       return d.unlimited ? this.header.numrecs : d.length;
     });
     const total = shape.reduce((a, b) => a * b, 1);
+    this._checkFits(v, total, 1);      // guard before allocating/looping
     // string(s): the last dim is the character length
     const clen = shape.length ? shape[shape.length - 1] : total;
     const nstr = clen ? total / clen : 1;
