@@ -64,6 +64,18 @@ Everything the app needs (Plotly, the HDF5 reader, the PDF exporter) is vendored
 under `docs/vendor/`, so the site is self-contained and works offline once
 loaded — no CDN, no external requests.
 
+### After you push an update
+
+Browsers cache the app's JavaScript, so after you push a change to Pages an
+already-open tab may keep running the old version. Do a **hard refresh** once
+to pick up the new code:
+
+- Windows/Linux: **Ctrl + Shift + R** (or Ctrl + F5)
+- Mac: **Cmd + Shift + R**
+
+(A private/incognito window always loads the latest, since it starts with an
+empty cache — handy for confirming an update went live.)
+
 ## How it's built (for maintainers)
 
 Pure browser JavaScript, ES modules, zero build step:
