@@ -39,10 +39,14 @@
     </section>
   </aside>
 
+  <div class="splitter" id="splitL" title="drag to resize · double-click to reset"></div>
+
   <!-- CENTER: plot -->
   <main id="center">
     <div id="plotWrap"><div id="plot"></div></div>
   </main>
+
+  <div class="splitter" id="splitR" title="drag to resize · double-click to reset"></div>
 
   <!-- RIGHT: controls -->
   <aside id="right">
@@ -67,6 +71,13 @@
         <label>Y ÷ <select id="cfg_yscale"></select></label>
       </div>
       <label>Colormap <select id="cfg_cmap"></select></label>
+      <div class="sub-h">Right Y axis (secondary)</div>
+      <label>Right Y label <input id="cfg_ylab2" type="text" placeholder="auto" /></label>
+      <div class="row wrap">
+        <label>Right Y ÷ <select id="cfg_yscale2"></select></label>
+        <label class="chk"><input id="cfg_logy2" type="checkbox" /> log</label>
+      </div>
+      <p class="hint">assign a trace to the right axis in “Selected trace → Y axis”.</p>
     </section>
 
     <section class="panel">
@@ -94,6 +105,7 @@
       <label>Line along <select id="ed_ldim"></select></label>
       <label>X values <select id="ed_xsrc"></select></label>
       <label>Sweep dim <select id="ed_sweep"></select></label>
+      <label>Y axis <select id="ed_yaxis"></select></label>
       <label>Legend label <input id="ed_label" type="text" placeholder="legend text" /></label>
       <label>Sweep label <input id="ed_sweeplabel" type="text"
         placeholder="per line, e.g. T = {v} K  ({v}=value, {n}=index)" /></label>

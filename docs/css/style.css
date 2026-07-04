@@ -16,8 +16,13 @@ header .logo { display: block; border-radius: 6px; flex: none; }
 header h1 { font-size: 17px; margin: 0; letter-spacing: .3px; }
 header .sub { color: #9fb4c8; font-size: 12px; }
 
-#layout { flex: 1; display: grid; grid-template-columns: 280px 1fr 320px; min-height: 0; }
-#left, #right { overflow-y: auto; padding: 10px; display: flex; flex-direction: column; gap: 10px; }
+#layout {
+  flex: 1; display: grid; min-height: 0;
+  grid-template-columns: var(--left-w, 300px) 7px minmax(0, 1fr) 7px var(--right-w, 330px);
+}
+.splitter { background: #dbe2ec; cursor: col-resize; }
+.splitter:hover, .splitter:active { background: #9db2ca; }
+#left, #right { overflow-y: auto; padding: 10px; display: flex; flex-direction: column; gap: 10px; min-width: 0; }
 #center { min-width: 0; padding: 10px; overflow: auto; display: flex; }
 #plotWrap { flex: 1; display: flex; align-items: flex-start; justify-content: center;
   background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: auto; }
@@ -53,14 +58,18 @@ button.active { background: #0d4a92; box-shadow: inset 0 0 0 2px #8fd0ff; }
 button.mini { flex: none; background: transparent; color: #90a0b3; padding: 0 4px; font-size: 12px; }
 button.mini:hover { color: #c0392b; background: transparent; }
 
-.tree { max-height: 42vh; overflow-y: auto; font-size: 12px; margin-top: 8px; }
-.tree-file-hdr { display: flex; justify-content: space-between; align-items: center;
+/* the tree scrolls both ways WITHIN itself; padding-bottom keeps a horizontal
+   scrollbar from covering the last row */
+.tree { max-height: 46vh; overflow: auto; font-size: 12px; margin-top: 8px; padding-bottom: 10px; }
+.tree-file-hdr { display: flex; justify-content: space-between; align-items: center; gap: 6px;
   font-weight: 700; color: #35404e; padding: 4px 2px; border-bottom: 1px solid var(--line); }
-.tree-var { display: flex; justify-content: space-between; gap: 8px; padding: 3px 6px;
+.tree-file-hdr span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tree-var { display: flex; justify-content: space-between; gap: 10px; padding: 3px 6px;
   border-radius: 4px; cursor: pointer; }
 .tree-var:hover { background: #eef4fc; }
 .tree-var.sel { background: #d6e2f3; }
 .tree-var.nonnum .vn { color: #9aa6b4; }
+.tree-var .vn { white-space: nowrap; }
 .tree-var .vd { color: #90a0b3; font-family: Consolas, monospace; font-size: 10px; white-space: nowrap; }
 .info { background: #fff; font-family: Consolas, monospace; font-size: 10.5px; color: #35404e;
   white-space: pre-wrap; max-height: 26vh; overflow: auto; margin: 0; }
@@ -86,4 +95,5 @@ footer#status { flex: none; background: #25303f; color: #e6ecf5; font-size: 12px
   #layout { grid-template-columns: 1fr; grid-auto-rows: min-content; overflow-y: auto; }
   #left, #right { overflow: visible; }
   #center { min-height: 60vh; }
+  .splitter { display: none; }
 }

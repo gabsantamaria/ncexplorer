@@ -19,6 +19,7 @@ export const DEFAULT_PLOTCFG = {
   mode: "2D lines", title: "", xlabel: "", ylabel: "", zlabel: "",
   legend: true, legend_loc: "best", grid: true, logx: false, logy: false,
   cmap: "Viridis", xunit: "", yunit: "",
+  ylabel2: "", yunit2: "", logy2: false,      // secondary (right) y axis
   lock_size: false, figw: 8.0, figh: 5.2,
 };
 
@@ -65,7 +66,7 @@ export function makeTrace(file, varName, lineDim, xsrc, sweep, slices, label) {
   return {
     file, var: varName, line_dim: lineDim, xsrc, sweep: sweep || "",
     slices: { ...(slices || {}) }, label: label || varName,
-    sweep_label: "", visible: true,
+    sweep_label: "", yaxis: "left", visible: true,
   };
 }
 
@@ -168,7 +169,9 @@ export function lineLabel(t, sweep, sval, j) {
 }
 
 // dsets: Map(file -> Dataset). Units are read from each trace's OWN file.
+// Returns the auto X label plus SEPARATE left/right Y labels (secondary axis).
 export function autoLabels(dsets, traces) {
+  let xl = "", ylLeft = "", ylRight = "";
   for (const t of traces) {
     if (!t.visible) continue;
     const ds = dsets && dsets.get && dsets.get(t.file);
@@ -176,19 +179,21 @@ export function autoLabels(dsets, traces) {
     const v = ds.variable(t.var);
     let yl = t.var;
     if (v.attrs.units) yl += ` (${v.attrs.units})`;
-    let xl;
-    if (t.xsrc && t.xsrc.startsWith("var:")) {
-      const name = t.xsrc.slice(4);
-      xl = name;
-      if (ds.vars[name] && ds.vars[name].attrs.units) xl += ` (${ds.vars[name].attrs.units})`;
-    } else if (t.xsrc === "coord") {
-      xl = t.line_dim;
-      if (ds.vars[t.line_dim] && ds.vars[t.line_dim].attrs.units)
-        xl += ` (${ds.vars[t.line_dim].attrs.units})`;
-    } else xl = `${t.line_dim} (index)`;
-    return { xl, yl };
+    if ((t.yaxis || "left") === "right") { if (!ylRight) ylRight = yl; }
+    else if (!ylLeft) ylLeft = yl;
+    if (!xl) {
+      if (t.xsrc && t.xsrc.startsWith("var:")) {
+        const name = t.xsrc.slice(4);
+        xl = name;
+        if (ds.vars[name] && ds.vars[name].attrs.units) xl += ` (${ds.vars[name].attrs.units})`;
+      } else if (t.xsrc === "coord") {
+        xl = t.line_dim;
+        if (ds.vars[t.line_dim] && ds.vars[t.line_dim].attrs.units)
+          xl += ` (${ds.vars[t.line_dim].attrs.units})`;
+      } else xl = `${t.line_dim} (index)`;
+    }
   }
-  return { xl: "", yl: "" };
+  return { xl, yl: ylLeft, ylLeft, ylRight };
 }
 
 // slider display value for a dim (coordinate value, or a differently-named axis)

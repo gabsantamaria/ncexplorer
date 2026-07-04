@@ -217,8 +217,8 @@ function populateEditor() {
   state._updating = true;
   const box = $("editor");
   const ldim = $("ed_ldim"), xsrc = $("ed_xsrc"), sweep = $("ed_sweep"),
-    label = $("ed_label"), swlabel = $("ed_sweeplabel");
-  [ldim, xsrc, sweep].forEach((s) => (s.innerHTML = ""));
+    label = $("ed_label"), swlabel = $("ed_sweeplabel"), yax = $("ed_yaxis");
+  [ldim, xsrc, sweep, yax].forEach((s) => (s.innerHTML = ""));
   label.value = ""; swlabel.value = "";
   if (state.cur < 0 || state.cur >= state.traces.length) { box.style.opacity = 0.5; state._updating = false; return; }
   box.style.opacity = 1;
@@ -240,6 +240,7 @@ function populateEditor() {
   if (!xs.includes(t.xsrc)) t.xsrc = "index";
   addOpts(xsrc, xs, t.xsrc);
   addOpts(sweep, ["(none)", ...dims.filter((d) => d !== t.line_dim)], t.sweep || "(none)");
+  addOpts(yax, ["left", "right"], t.yaxis || "left");
   label.value = t.label || t.var;
   swlabel.value = t.sweep_label || "";
   swlabel.disabled = !t.sweep;
@@ -275,6 +276,7 @@ function editorChanged(what) {
     const row = $("traceList").children[state.cur];
     if (row) row.querySelector("span").textContent = traceName(t);
   } else if (what === "sweep_label") { t.sweep_label = $("ed_sweeplabel").value; }
+  else if (what === "yaxis") { t.yaxis = $("ed_yaxis").value === "right" ? "right" : "left"; }
   redraw();
 }
 
@@ -325,8 +327,12 @@ function redraw() {
   const c = state.plotcfg;
   const fetched = fetchAll();
   const xf = X.PREFIX_FACTOR[c.xunit] || 1;
-  const yf = X.PREFIX_FACTOR[c.yunit] || 1;
+  const yfL = X.PREFIX_FACTOR[c.yunit] || 1;
+  const yfR = X.PREFIX_FACTOR[c.yunit2] || 1;
   const is3d = c.mode === "3D waterfall";
+  // a trace's y unit factor / Plotly axis, by its left/right assignment
+  const traceOnRight = (ti) => !is3d && (state.traces[ti].yaxis === "right");
+  const yfFor = (ti) => traceOnRight(ti) ? yfR : yfL;
   const notes = [];
 
   // group sweep ranges by name (shared colorbar only if all share one sweep)
@@ -365,6 +371,8 @@ function redraw() {
     const base = cycle[f.ti % cycle.length];
     if (f.sweep && f.lines.length > 12 && c.legend && c.mode === "2D lines")
       notes.push(`'${f.t.label || f.t.var}': ${f.lines.length} sweep lines — legend omitted`);
+    const yf = yfFor(f.ti);
+    const onRight = traceOnRight(f.ti);
     f.lines.forEach((ln, j) => {
       const m = Math.min(ln.x.length, ln.y.length);
       const xs = new Array(m), ys = new Array(m);
@@ -384,8 +392,9 @@ function redraw() {
         // SVG scatter keeps exports truly vector; only very large lines fall
         // back to WebGL (scattergl) for rendering performance
         data.push({ type: m > 20000 ? "scattergl" : "scatter", mode: "lines",
-          x: xs, y: ys, line: { color, width: 1.5 }, name, showlegend,
-          hoverinfo: "x+y+name" });
+          x: xs, y: ys, yaxis: onRight ? "y2" : "y",
+          line: { color, width: onRight ? 1.5 : 1.5, dash: onRight ? "dot" : "solid" },
+          name, showlegend, hoverinfo: "x+y+name" });
       }
     });
   }
@@ -404,17 +413,20 @@ function redraw() {
     notes.push("Rainbow mode needs a trace with a sweep dim");
   }
 
-  // markers (2D only), anchored to (trace,line,idx) so they follow sliders
+  // markers (2D only), anchored to (trace,line,idx) so they follow sliders;
+  // each marker sits on its trace's own y axis
   state._markerXY = [];
-  if (!is3d) drawMarkers(data, fetched, xf, yf);
+  const anyRight = !is3d && fetched.some((f) => traceOnRight(f.ti));
+  if (!is3d) drawMarkers(data, fetched, xf, yfFor, traceOnRight);
   else if (state.markers.length) notes.push("markers are shown in the 2D views only");
 
   const auto = X.autoLabels(state.dsets, state.traces);
   const xlab = c.xlabel || X.scaledLabel(auto.xl || "", c.xunit);
-  const ylab = c.ylabel || X.scaledLabel(auto.yl || "", c.yunit);
+  const ylab = c.ylabel || X.scaledLabel(auto.ylLeft || "", c.yunit);
+  const ylab2 = c.ylabel2 || X.scaledLabel(auto.ylRight || "", c.yunit2);
   const layout = {
     title: { text: c.title || "", font: { size: 15 } },
-    margin: { l: 64, r: 20, t: c.title ? 44 : 20, b: 54 },
+    margin: { l: 64, r: anyRight ? 64 : 20, t: c.title ? 44 : 20, b: 54 },
     showlegend: c.legend && data.some((d) => d.showlegend),
     legend: legendLoc(c.legend_loc),
     paper_bgcolor: "white", plot_bgcolor: "white",
@@ -430,6 +442,10 @@ function redraw() {
   } else {
     layout.xaxis = { title: { text: xlab }, showgrid: c.grid, zeroline: false, type: c.logx ? "log" : "linear" };
     layout.yaxis = { title: { text: ylab }, showgrid: c.grid, zeroline: false, type: c.logy ? "log" : "linear" };
+    if (anyRight) {
+      layout.yaxis2 = { title: { text: ylab2 }, overlaying: "y", side: "right",
+        showgrid: false, zeroline: false, type: c.logy2 ? "log" : "linear" };
+    }
   }
   if (c.lock_size) {
     const clamp = (v, d) => Math.min(40, Math.max(2, Number.isFinite(v) ? v : d));
@@ -445,10 +461,11 @@ function redraw() {
   if (notes.length) status(notes.join(" | "));
 }
 
-function drawMarkers(data, fetched, xf, yf) {
+function drawMarkers(data, fetched, xf, yfFor, traceOnRight) {
   const byTrace = {};
   for (const f of fetched) byTrace[f.ti] = f.lines;
-  const mx = [], my = [], mtext = [];
+  // one overlay per y axis so a marker lands on its trace's own axis
+  const groups = { y: { mx: [], my: [], mt: [] }, y2: { mx: [], my: [], mt: [] } };
   state._markerXY = [];
   state.markers.forEach((mk, mi) => {
     const lines = byTrace[mk.trace];
@@ -458,14 +475,18 @@ function drawMarkers(data, fetched, xf, yf) {
     const m = Math.min(ln.x.length, ln.y.length);
     if (!m) return;
     const k = Math.max(0, Math.min(mk.idx | 0, m - 1));
-    const xs = ln.x[k] / xf, ys = ln.y[k] / yf;
+    const ax = traceOnRight(mk.trace) ? "y2" : "y";
+    const xs = ln.x[k] / xf, ys = ln.y[k] / yfFor(mk.trace);
     if (!Number.isFinite(xs) || !Number.isFinite(ys)) return;
-    mx.push(xs); my.push(ys); mtext.push(`${X.fmt6(xs)}, ${X.fmt6(ys)}`);
-    state._markerXY.push({ mi, x: xs, y: ys });
+    const g = groups[ax];
+    g.mx.push(xs); g.my.push(ys); g.mt.push(`${X.fmt6(xs)}, ${X.fmt6(ys)}`);
+    state._markerXY.push({ mi, x: xs, y: ys, axis: ax });
   });
-  if (mx.length) {
+  for (const ax of ["y", "y2"]) {
+    const g = groups[ax];
+    if (!g.mx.length) continue;
     data.push({
-      type: "scatter", x: mx, y: my, mode: "markers+text", text: mtext,
+      type: "scatter", x: g.mx, y: g.my, yaxis: ax, mode: "markers+text", text: g.mt,
       textposition: "top right", textfont: { size: 10, color: "#c0392b" },
       marker: { symbol: "circle-open", size: 11, color: "#c0392b", line: { width: 2 } },
       hoverinfo: "text", showlegend: false, cliponaxis: false,
@@ -499,16 +520,17 @@ function onPlotContext(e) {
   if (!state.markerMode || !state._markerXY || !state._markerXY.length) return;
   e.preventDefault();
   const g = gd();
-  const xa = g._fullLayout.xaxis, ya = g._fullLayout.yaxis;
+  const xa = g._fullLayout.xaxis, ya = g._fullLayout.yaxis, ya2 = g._fullLayout.yaxis2;
   if (!xa || !ya) return;
   const rect = g.getBoundingClientRect();
   const px = e.clientX - rect.left - g._fullLayout.margin.l;
   const py = e.clientY - rect.top - g._fullLayout.margin.t;
   let best = -1, bd = 30 * 30;
-  state._markerXY.forEach(({ mi, x, y }) => {
-    // c2p applies the axis transform (log10 on a log axis), so the hit-test
-    // is correct on both linear and log axes; c2p === l2p on linear
-    const dx = xa.c2p(x) - px, dy = ya.c2p(y) - py;
+  state._markerXY.forEach(({ mi, x, y, axis }) => {
+    // c2p applies the axis transform (log10 on a log axis) and each marker's
+    // own y axis (primary or secondary), so the hit-test is always correct
+    const yax = (axis === "y2" && ya2) ? ya2 : ya;
+    const dx = xa.c2p(x) - px, dy = yax.c2p(y) - py;
     const d = dx * dx + dy * dy;
     if (d < bd) { bd = d; best = mi; }
   });
@@ -527,6 +549,9 @@ function cfgChanged() {
   c.cmap = $("cfg_cmap").value;
   c.xunit = $("cfg_xscale").value === "—" ? "" : $("cfg_xscale").value;
   c.yunit = $("cfg_yscale").value === "—" ? "" : $("cfg_yscale").value;
+  c.ylabel2 = $("cfg_ylab2").value;
+  c.yunit2 = $("cfg_yscale2").value === "—" ? "" : $("cfg_yscale2").value;
+  c.logy2 = $("cfg_logy2").checked;
   c.lock_size = $("cfg_lock").checked;
   c.figw = +$("cfg_figw").value; c.figh = +$("cfg_figh").value;
   $("cfg_figw").disabled = !c.lock_size; $("cfg_figh").disabled = !c.lock_size;
@@ -542,6 +567,8 @@ function applyCfgWidgets() {
   $("cfg_grid").checked = c.grid; $("cfg_logx").checked = c.logx; $("cfg_logy").checked = c.logy;
   $("cfg_cmap").value = c.cmap;
   $("cfg_xscale").value = c.xunit || "—"; $("cfg_yscale").value = c.yunit || "—";
+  $("cfg_ylab2").value = c.ylabel2 || ""; $("cfg_yscale2").value = c.yunit2 || "—";
+  $("cfg_logy2").checked = !!c.logy2;
   $("cfg_lock").checked = c.lock_size; $("cfg_figw").value = c.figw; $("cfg_figh").value = c.figh;
   $("cfg_figw").disabled = !c.lock_size; $("cfg_figh").disabled = !c.lock_size;
   state._updating = false;
@@ -576,24 +603,30 @@ async function exportPDF() {
 
 function exportCSV() {
   const c = state.plotcfg;
-  const xf = X.PREFIX_FACTOR[c.xunit] || 1, yf = X.PREFIX_FACTOR[c.yunit] || 1;
+  const xf = X.PREFIX_FACTOR[c.xunit] || 1;
+  const yfL = X.PREFIX_FACTOR[c.yunit] || 1, yfR = X.PREFIX_FACTOR[c.yunit2] || 1;
   const rows = [];
   for (const t of state.traces) {
     if (t.visible === false) continue;
     const ds = state.dsets.get(t.file);
     if (!ds) continue;
+    const yf = t.yaxis === "right" ? yfR : yfL;   // each trace's own axis scale
+    const axcol = t.yaxis === "right" ? "right" : "left";
     const { lines } = X.traceLines(ds, t, status);
     for (const ln of lines) {
       const m = Math.min(ln.x.length, ln.y.length);
       const lab = csvField(t.label || t.var);
       const sv = ln.sval == null ? "" : X.fmt6(ln.sval);
-      for (let k = 0; k < m; k++) rows.push(`"${lab}",${sv},${ln.x[k] / xf},${ln.y[k] / yf}`);
+      for (let k = 0; k < m; k++)
+        rows.push(`"${lab}",${sv},${ln.x[k] / xf},${ln.y[k] / yf},${axcol}`);
     }
   }
   if (!rows.length) { status("Nothing plotted — nothing to export."); return; }
   let head = "# NC Explorer export (long format)\n";
-  if (xf !== 1 || yf !== 1) head += `# axis scale: x÷${xf} (${c.xunit || "1"}), y÷${yf} (${c.yunit || "1"}) — as displayed\n`;
-  head += "trace,sweep,x,y\n";
+  if (xf !== 1 || yfL !== 1 || yfR !== 1)
+    head += `# axis scale: x÷${xf} (${c.xunit || "1"}), y-left÷${yfL} (${c.yunit || "1"}), `
+      + `y-right÷${yfR} (${c.yunit2 || "1"}) — as displayed\n`;
+  head += "trace,sweep,x,y,yaxis\n";
   triggerDownload(new Blob([head + rows.join("\n") + "\n"], { type: "text/csv" }), "ncplot_" + stamp() + ".csv");
   status(`Exported ${rows.length} rows.`);
 }
@@ -653,7 +686,8 @@ function applyProject(proj) {
     projToNew[pi] = newtraces.length;
     newtraces.push({ file: openName, var: t.var, line_dim: ldim, sweep, slices,
       xsrc: String(t.xsrc || "index"), label: String(t.label || t.var),
-      sweep_label: String(t.sweep_label || ""), visible: t.visible !== false });
+      sweep_label: String(t.sweep_label || ""),
+      yaxis: t.yaxis === "right" ? "right" : "left", visible: t.visible !== false });
   });
   state.traces = newtraces;
   state.markers = (proj.markers || []).filter((m) => projToNew[m.trace] !== undefined)
@@ -687,6 +721,56 @@ function stamp() {
   return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
 }
 
+// draggable dividers that resize the left / right panels; widths persist
+function initSplitters() {
+  const layout = $("layout");
+  const setW = (leftPx, rightPx) => {
+    if (leftPx != null) layout.style.setProperty("--left-w", leftPx + "px");
+    if (rightPx != null) layout.style.setProperty("--right-w", rightPx + "px");
+    try { Plotly.Plots.resize(gd()); } catch (e) { /* not drawn yet */ }
+  };
+  try {
+    const s = JSON.parse(localStorage.getItem("ncx.panels") || "{}");
+    setW(s.left, s.right);
+  } catch (e) { /* ignore */ }
+  const curW = () => {
+    const cs = getComputedStyle(layout);
+    return {
+      left: parseFloat(cs.getPropertyValue("--left-w")) || 300,
+      right: parseFloat(cs.getPropertyValue("--right-w")) || 330,
+    };
+  };
+  const drag = (splitter, which) => {
+    if (!splitter) return;
+    splitter.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      const startX = e.clientX, start = curW();
+      document.body.style.cursor = "col-resize";
+      document.body.style.userSelect = "none";
+      const onMove = (ev) => {
+        const dx = ev.clientX - startX;
+        if (which === "left") setW(Math.max(180, Math.min(600, start.left + dx)), null);
+        else setW(null, Math.max(220, Math.min(640, start.right - dx)));
+      };
+      const onUp = () => {
+        document.removeEventListener("mousemove", onMove);
+        document.removeEventListener("mouseup", onUp);
+        document.body.style.cursor = ""; document.body.style.userSelect = "";
+        try { localStorage.setItem("ncx.panels", JSON.stringify(curW())); } catch (e) {}
+      };
+      document.addEventListener("mousemove", onMove);
+      document.addEventListener("mouseup", onUp);
+    });
+    // double-click a divider resets that panel to its default width
+    splitter.addEventListener("dblclick", () => {
+      if (which === "left") setW(300, null); else setW(null, 330);
+      try { localStorage.setItem("ncx.panels", JSON.stringify(curW())); } catch (e) {}
+    });
+  };
+  drag($("splitL"), "left");
+  drag($("splitR"), "right");
+}
+
 // =====================================================================  wiring
 function init() {
   // populate static selects
@@ -695,6 +779,7 @@ function init() {
   addOpts($("cfg_cmap"), CMAP_NAMES, "Viridis");
   addOpts($("cfg_xscale"), X.UNIT_PREFIXES, "—");
   addOpts($("cfg_yscale"), X.UNIT_PREFIXES, "—");
+  addOpts($("cfg_yscale2"), X.UNIT_PREFIXES, "—");
   applyCfgWidgets();
 
   $("btnOpen").onclick = () => $("fileInput").click();
@@ -707,13 +792,16 @@ function init() {
   $("ed_sweep").onchange = () => editorChanged("sweep");
   $("ed_label").onchange = () => editorChanged("label");
   $("ed_sweeplabel").onchange = () => editorChanged("sweep_label");
+  $("ed_yaxis").onchange = () => editorChanged("yaxis");
   ["cfg_mode", "cfg_title", "cfg_xlab", "cfg_ylab", "cfg_zlab", "cfg_legloc",
-    "cfg_cmap", "cfg_xscale", "cfg_yscale", "cfg_figw", "cfg_figh"].forEach((id) => {
+    "cfg_cmap", "cfg_xscale", "cfg_yscale", "cfg_ylab2", "cfg_yscale2",
+    "cfg_figw", "cfg_figh"].forEach((id) => {
     $(id).onchange = cfgChanged;
   });
-  ["cfg_legend", "cfg_grid", "cfg_logx", "cfg_logy", "cfg_lock"].forEach((id) => {
+  ["cfg_legend", "cfg_grid", "cfg_logx", "cfg_logy", "cfg_logy2", "cfg_lock"].forEach((id) => {
     $(id).onchange = cfgChanged;
   });
+  initSplitters();
   $("btnMarker").onclick = () => {
     state.markerMode = !state.markerMode;
     $("btnMarker").classList.toggle("active", state.markerMode);
