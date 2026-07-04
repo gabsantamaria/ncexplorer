@@ -1,8 +1,10 @@
 name: Deploy NC Explorer to GitHub Pages
 
 # Publishes the static site in docs/ to GitHub Pages on every push to main.
-# Set Settings -> Pages -> Source = "GitHub Actions" and make this the ONLY
-# Pages workflow (delete any other one that deploys to Pages).
+# Set Settings -> Pages -> Build and deployment -> Source = "GitHub Actions",
+# and make this the ONLY Pages workflow (delete any other one that deploys to
+# Pages). If Source is "Deploy from a branch", GitHub runs its OWN
+# pages-build-deployment in parallel and you get two github-pages artifacts.
 
 on:
   push:
@@ -22,11 +24,14 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  deploy:
+  # BUILD packages docs/ into the github-pages artifact. It is kept SEPARATE from
+  # deploy on purpose: if the deploy step fails transiently and you click
+  # "Re-run failed jobs", only `deploy` re-runs — build does NOT run again, so a
+  # second github-pages artifact is never uploaded. (Uploading twice under one
+  # run is what triggers: "Multiple artifacts named github-pages were
+  # unexpectedly found ... Artifact count is 2".)
+  build:
     runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -36,6 +41,14 @@ jobs:
         uses: actions/upload-pages-artifact@v3
         with:
           path: docs
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
       - name: Deploy to Pages
         id: deployment
         uses: actions/deploy-pages@v4
