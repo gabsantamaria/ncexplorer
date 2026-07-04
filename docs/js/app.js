@@ -440,11 +440,17 @@ function redraw() {
     };
     if (c.logx || c.logy) notes.push("log axes are not applied in the 3D view");
   } else {
-    layout.xaxis = { title: { text: xlab }, showgrid: c.grid, zeroline: false, type: c.logx ? "log" : "linear" };
-    layout.yaxis = { title: { text: ylab }, showgrid: c.grid, zeroline: false, type: c.logy ? "log" : "linear" };
+    // a full box frame with visible axis lines and outward ticks
+    const frame = { showline: true, linecolor: "#2a2a2a", linewidth: 1.2,
+      ticks: "outside", tickcolor: "#2a2a2a", ticklen: 5 };
+    layout.xaxis = { title: { text: xlab }, showgrid: c.grid, zeroline: false,
+      type: c.logx ? "log" : "linear", mirror: true, ...frame };
+    layout.yaxis = { title: { text: ylab }, showgrid: c.grid, zeroline: false,
+      type: c.logy ? "log" : "linear", mirror: anyRight ? false : true, ...frame };
     if (anyRight) {
       layout.yaxis2 = { title: { text: ylab2 }, overlaying: "y", side: "right",
-        showgrid: false, zeroline: false, type: c.logy2 ? "log" : "linear" };
+        showgrid: false, zeroline: false, type: c.logy2 ? "log" : "linear",
+        mirror: true, ...frame };
     }
   }
   if (c.lock_size) {
@@ -575,13 +581,16 @@ function applyCfgWidgets() {
 }
 
 // =====================================================================  export
+const PNG_DPI = 600;
 function exportImage(fmt) {
   const c = state.plotcfg;
   const w = c.lock_size ? Math.round(c.figw * PX_PER_IN) : gd().clientWidth;
   const h = c.lock_size ? Math.round(c.figh * PX_PER_IN) : gd().clientHeight;
-  Plotly.downloadImage(gd(), { format: fmt, width: w, height: h, scale: fmt === "png" ? 2 : 1,
+  // PNG at 600 DPI relative to the logical (96 px/in) figure size
+  const scale = fmt === "png" ? PNG_DPI / PX_PER_IN : 1;
+  Plotly.downloadImage(gd(), { format: fmt, width: w, height: h, scale,
     filename: "ncplot_" + stamp() });
-  status(`Exported ${fmt.toUpperCase()}.`);
+  status(`Exported ${fmt.toUpperCase()}${fmt === "png" ? ` (${PNG_DPI} dpi)` : ""}.`);
 }
 
 async function exportPDF() {
@@ -590,7 +599,11 @@ async function exportPDF() {
   const h = c.lock_size ? Math.round(c.figh * PX_PER_IN) : gd().clientHeight;
   try {
     const uri = await Plotly.toImage(gd(), { format: "svg", width: w, height: h });
-    const svgText = decodeURIComponent(uri.replace(/^data:image\/svg\+xml,/, ""));
+    let svgText = decodeURIComponent(uri.replace(/^data:image\/svg\+xml,/, ""));
+    // Plotly labels negatives with the Unicode MINUS SIGN (U+2212), which
+    // jsPDF's built-in Helvetica can't render (it shows a fallback glyph that
+    // looks like "). Swap it for an ASCII hyphen so the vector PDF is clean.
+    svgText = svgText.replace(/−/g, "-");
     const svgEl = new DOMParser().parseFromString(svgText, "image/svg+xml").documentElement;
     const { jsPDF } = window.jspdf;
     const pdf = new jsPDF({ orientation: w >= h ? "landscape" : "portrait", unit: "pt", format: [w, h] });
