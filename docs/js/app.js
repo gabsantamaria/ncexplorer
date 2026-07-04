@@ -32,7 +32,7 @@ async function openFile(file) {
   if (state.dsets.has(name)) return { name, reused: true };   // kept, not reloaded
   const buf = await file.arrayBuffer();
   let ds;
-  try { ds = openBuffer(buf, name); }
+  try { ds = await openBuffer(buf, name); }   // HDF5 path is async (WASM)
   catch (e) { status(`Cannot open ${name}: ${e.message}`); return null; }
   state.dsets.set(name, ds);
   state.fileOrder.push(name);

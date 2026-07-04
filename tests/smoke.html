@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <title>NC Explorer — smoke test</title>
-<script src="../docs/vendor/hdf5.js"></script>
+<script src="../docs/vendor/h5wasm.js"></script>
 <style>body{font-family:Consolas,monospace;font-size:13px;padding:12px}
 .ok{color:#0a7}.fail{color:#c0392b;font-weight:bold}</style>
 </head>
@@ -25,7 +25,7 @@ function check(name, cond, extra) {
 }
 async function load(url) {
   const buf = await (await fetch(url)).arrayBuffer();
-  return openBuffer(buf, url.split("/").pop());
+  return await openBuffer(buf, url.split("/").pop());   // HDF5 path is async
 }
 
 (async () => {
@@ -95,6 +95,22 @@ async function load(url) {
       [gr.lines.length, gr.lines[0] && gr.lines[0].y.length]);
     check("hdf5 gain x is frequency (Hz)", gr.lines[0].x[gr.lines[0].x.length-1] > 1e9,
       gr.lines[0].x.at(-1));
+
+    // ---- NetCDF-4/HDF5 with DENSE attribute storage (h5wasm reads it all) ----
+    try {
+      const dp = await load("data/darpa.nc");
+      const spec = dp.variable("spectrums");
+      check("darpa spectrums dims resolved (not synthetic)",
+        spec.dims.join(",") === "TraceIndex,stimulusFrequency,stimulusAmp,trace",
+        spec.dims.join(","));
+      check("darpa spectrums units read (dense attrs)", spec.attrs.units === "DBM",
+        JSON.stringify(spec.attrs.units));
+      check("darpa spectrums extra metadata read", spec.attrs.StartFreq !== undefined);
+      // frequencies (shares 3 of the 4 dims) offered as an X source vs TraceIndex
+      const share = new Set(dp.variable("frequencies").dims);
+      check("darpa frequencies shares TraceIndex + subset",
+        share.has("TraceIndex") && [...share].every((d) => spec.dims.includes(d)));
+    } catch (e) { check("darpa.nc test", false, e.message); }
 
     check("=== NetCDF-3 and NetCDF-4/HDF5 both read and sliced correctly ===", true);
   } catch (e) {

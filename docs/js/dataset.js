@@ -6,14 +6,14 @@
 import { parseNetCDF3 } from "./netcdf3.js";
 import { parseHDF5 } from "./hdf5.js";
 
-export function openBuffer(buffer, filename) {
+export async function openBuffer(buffer, filename) {
   if (!buffer || buffer.byteLength < 4)
     throw new Error("file is too small to be a NetCDF file");
   const u8 = new Uint8Array(buffer, 0, 4);
   if (u8[0] === 0x43 && u8[1] === 0x44 && u8[2] === 0x46)          // "CDF"
     return new Dataset(parseNetCDF3(buffer), filename);
   if (u8[0] === 0x89 && u8[1] === 0x48 && u8[2] === 0x44 && u8[3] === 0x46) // HDF5
-    return new Dataset(parseHDF5(buffer, filename), filename);
+    return new Dataset(await parseHDF5(buffer, filename), filename);   // WASM: async
   throw new Error("not a NetCDF file (magic is neither 'CDF' nor HDF5)");
 }
 
@@ -30,6 +30,7 @@ export class Variable {
     this.attrs = v.attrs || {};
     this.dtype = v.dtype;
     this.isChar = !!v.isChar;
+    this._numeric = v.numeric;          // reader-supplied flag (preferred)
     this.data = v.data;                 // flat numeric array, or string / string[]
     this._maskFill();
   }
@@ -55,6 +56,7 @@ export class Variable {
   get size() { return this.shape.reduce((a, b) => a * b, 1); }
   isNumeric() {
     if (this.isChar) return false;
+    if (this._numeric !== undefined) return this._numeric;   // reader-supplied
     const d = String(this.dtype || "");
     return NC3_NUMERIC.test(d) || NPY_NUMERIC.test(d);
   }

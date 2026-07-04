@@ -91,13 +91,13 @@ Pure browser JavaScript, ES modules, zero build step:
 | file | role |
 |---|---|
 | `docs/js/netcdf3.js` | self-contained NetCDF classic reader (validated byte-exact vs xarray) |
-| `docs/js/hdf5.js`    | NetCDF-4/HDF5 via jsfive + the netCDF-4 dimension-convention decoder |
+| `docs/js/hdf5.js`    | NetCDF-4/HDF5 via h5wasm (complete WebAssembly HDF5 reader) + the netCDF-4 convention decoder |
 | `docs/js/dataset.js` | unified dataset object + C-order slicing (validated vs numpy) |
 | `docs/js/explore.js` | trace/slice/scale logic, ported from the desktop `NC_Explorer.py` |
 | `docs/js/colormaps.js` | colormaps shared by rainbow lines and the colorbar |
 | `docs/js/app.js`     | UI, Plotly rendering, markers, exports, projects |
 | `docs/js/project.js` | `.ncproj` save/load |
-| `docs/vendor/`       | Plotly, jsfive, jsPDF, svg2pdf (vendored) |
+| `docs/vendor/`       | Plotly, h5wasm, jsPDF, svg2pdf (vendored) |
 
 `NC_Explorer_desktop.py` is the original PyQt5 desktop version this web app was
 ported from — kept for reference and feature parity.

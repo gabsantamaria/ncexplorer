@@ -1,0 +1,36 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>h5wasm probe</title>
+<script src="../docs/vendor/h5wasm.js"></script>
+</head><body><pre id="o">loading…</pre>
+<script>
+const o = document.getElementById("o");
+function log(x){ o.textContent += "\n" + x; }
+(async () => {
+  try {
+    log("h5wasm global type: " + typeof h5wasm);
+    log("h5wasm keys: " + Object.keys(h5wasm).join(", "));
+    const mod = await (h5wasm.ready || h5wasm.default && h5wasm.default.ready || Promise.resolve(h5wasm));
+    log("ready resolved. FS? " + (typeof (h5wasm.FS || (mod&&mod.FS))));
+    const H = h5wasm.FS ? h5wasm : mod;   // where FS/File live
+    log("File ctor? " + typeof H.File + "  FS? " + typeof H.FS);
+    const buf = await (await fetch("data/darpa.nc")).arrayBuffer();
+    H.FS.writeFile("darpa.nc", new Uint8Array(buf));
+    const f = new H.File("darpa.nc", "r");
+    log("root keys: " + f.keys().join(", "));
+    const spec = f.get("spectrums");
+    log("spectrums shape: " + JSON.stringify(spec.shape) + "  dtype: " + spec.dtype);
+    log("spectrums attrs keys: " + JSON.stringify(Object.keys(spec.attrs)));
+    log("spectrums _Netcdf4Coordinates: " + JSON.stringify(spec.attrs["_Netcdf4Coordinates"]));
+    log("spectrums units: " + JSON.stringify(spec.attrs["units"]));
+    log("spectrums _FillValue: " + JSON.stringify(spec.attrs["_FillValue"]));
+    const sc = f.get("stimulusFrequency");
+    log("stimulusFrequency attrs: " + JSON.stringify(Object.keys(sc.attrs)) + " CLASS=" + JSON.stringify(sc.attrs["CLASS"]));
+    // how is value returned?
+    const val = spec.value;
+    log("spectrums value: type=" + (val && val.constructor && val.constructor.name) + " len=" + (val && val.length));
+    log("spectrums to_array()? " + (typeof spec.to_array));
+    log("=== PROBE OK ===");
+    window.__probe = "ok";
+  } catch(e) { log("ERROR: " + e.message + "\n" + e.stack); window.__probe = "err"; }
+})();
+</script></body></html>

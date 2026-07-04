@@ -241,7 +241,7 @@ export function parseNetCDF3(buffer) {
     const isChar = v.nctype === 2;
     variables[v.name] = {
       dims: dimNames, shape, attrs: v.atts,
-      dtype: NC_TYPE[v.nctype].name, isChar,
+      dtype: NC_TYPE[v.nctype].name, isChar, numeric: !isChar,
       data: r.readVariable(v),
     };
   }

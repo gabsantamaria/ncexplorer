@@ -9,7 +9,8 @@
 <link rel="stylesheet" href="css/style.css" />
 <!-- vendored libraries (self-contained; work offline once the page is cached) -->
 <script src="vendor/plotly.min.js"></script>
-<script src="vendor/hdf5.js"></script>
+<!-- h5wasm: complete WebAssembly HDF5 reader (NetCDF-4 files) -->
+<script src="vendor/h5wasm.js"></script>
 <script src="vendor/jspdf.umd.min.js"></script>
 <!-- svg2pdf.js patches window.jspdf's jsPDF with an async .svg() method -->
 <script src="vendor/svg2pdf.umd.min.js"></script>
@@ -31,7 +32,7 @@
         <button id="btnAdd" class="ghost">Add trace ➜</button>
       </div>
       <div id="tree" class="tree"></div>
-      <input type="file" id="fileInput" accept=".nc,.nc4,.cdf" multiple hidden />
+      <input type="file" id="fileInput" accept=".nc,.nc4,.cdf,.h5,.hdf5" multiple hidden />
     </section>
     <section class="panel">
       <h2>Info</h2>
