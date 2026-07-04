@@ -21,7 +21,10 @@ browser. Nothing is sent anywhere.
   sharing the dimensions* (e.g. a 2-D wavelength/time axis).
 - **Combine traces** from any number of files on one plot: **2D lines**,
   **Rainbow** (a sweep family colored by a colormap + colorbar), or **3D
-  waterfall**.
+  waterfall**. The **colorbar** can be captioned and mapped to the variable of
+  your choice — the sweep coordinate, the index, or *any parallel array sharing
+  the sweep dimension* (just like the X axis), so a family of traces is colored
+  by the real parameter value instead of a bare index.
 - **Tabs — many plots, one project**: each tab is its own independently-formatted
   plot (its own traces, cosmetics, markers, sliders), while the **datasets on the
   left are shared** across all tabs. Add (`＋`), rename (double-click), close, and

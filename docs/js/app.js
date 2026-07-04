@@ -485,8 +485,9 @@ function populateEditor() {
   state._updating = true;
   const box = $("editor");
   const ldim = $("ed_ldim"), xsrc = $("ed_xsrc"), sweep = $("ed_sweep"),
-    label = $("ed_label"), swlabel = $("ed_sweeplabel"), yax = $("ed_yaxis");
-  [ldim, xsrc, sweep, yax].forEach((s) => (s.innerHTML = ""));
+    label = $("ed_label"), swlabel = $("ed_sweeplabel"), yax = $("ed_yaxis"),
+    ssrc = $("ed_ssrc");
+  [ldim, xsrc, sweep, yax, ssrc].forEach((s) => (s.innerHTML = ""));
   label.value = ""; swlabel.value = "";
   if (state.cur < 0 || state.cur >= state.traces.length) { box.style.opacity = 0.5; state._updating = false; return; }
   box.style.opacity = 1;
@@ -509,6 +510,20 @@ function populateEditor() {
   addOpts(xsrc, xs, t.xsrc);
   addOpts(sweep, ["(none)", ...dims.filter((d) => d !== t.line_dim)], t.sweep || "(none)");
   addOpts(yax, ["left", "right"], t.yaxis || "left");
+  // colorbar (sweep-value) source — analogous to x sources but keyed on the
+  // sweep dim; only meaningful when a sweep is set
+  const sw = t.sweep || "";
+  const ss = ["coord", "index"];
+  if (sw) {
+    for (const [nm, sv] of Object.entries(ds.vars)) {
+      if (nm === t.var || nm === sw || !sv.isNumeric()) continue;
+      const sd = new Set(sv.dims);
+      if (sd.has(sw) && [...sd].every((d) => dims.includes(d))) ss.push("var:" + nm);
+    }
+  }
+  if (!t.ssrc || !ss.includes(t.ssrc)) t.ssrc = "coord";   // repair missing/stale
+  addOpts(ssrc, ss, t.ssrc);
+  ssrc.disabled = !sw;
   label.value = t.label || t.var;
   swlabel.value = t.sweep_label || "";
   swlabel.disabled = !t.sweep;
@@ -541,12 +556,14 @@ function editorChanged(what) {
     let nv = $("ed_sweep").value; nv = nv === "(none)" ? "" : nv;
     if (nv !== t.sweep) {
       t.sweep = nv; $("ed_sweeplabel").disabled = !nv;
+      t.ssrc = "coord";     // a new sweep dim starts from its own coordinate
       const keep = {};
       ds.variable(t.var).dims.forEach((d) => { if (d !== t.line_dim && d !== nv) keep[d] = t.slices[d] || 0; });
       t.slices = keep;
-      rebuildSliders();
+      populateEditor(); rebuildSliders();   // refresh the colorbar-source options
     }
-  } else if (what === "label") {
+  } else if (what === "ssrc") { t.ssrc = $("ed_ssrc").value; }
+  else if (what === "label") {
     t.label = $("ed_label").value.trim() || t.var;
     const row = $("traceList").children[state.cur];
     if (row) row.querySelector("span").textContent = traceName(t);
@@ -698,10 +715,15 @@ function redraw() {
   // colored in 2D but had its legend omitted (>12 lines) so colors stay mappable
   if ((c.mode === "Rainbow" || (!is3d && coloredNoLegend)) && sharedName) {
     const [lo, hi] = ranges[sharedName];
+    // caption: explicit override, else the chosen sweep source's label taken
+    // from the first trace driving this shared colorbar
+    const rep = fetched.find((f) => f.sweep === sharedName);
+    const clab = (c.clabel && c.clabel.trim())
+      || (rep ? X.sweepSourceLabel(state.dsets.get(rep.t.file), rep.t, sharedName) : sharedName);
     data.push({
       type: "scatter", x: [firstX ? firstX[0] : 0], y: [null], mode: "markers",
       marker: { size: 0.1, color: [lo], colorscale: cmapScale(c.cmap), cmin: lo, cmax: hi > lo ? hi : lo + 1,
-        colorbar: { title: { text: sharedName, side: "right" }, thickness: 14 }, showscale: true },
+        colorbar: { title: { text: clab, side: "right" }, thickness: 14 }, showscale: true },
       hoverinfo: "skip", showlegend: false,
     });
   } else if (c.mode === "Rainbow" && !Object.keys(ranges).length) {
@@ -878,6 +900,7 @@ function cfgChanged() {
   c.mode = $("cfg_mode").value;
   c.title = $("cfg_title").value; c.xlabel = $("cfg_xlab").value;
   c.ylabel = $("cfg_ylab").value; c.zlabel = $("cfg_zlab").value;
+  c.clabel = $("cfg_clabel").value;
   c.legend = $("cfg_legend").checked; c.legend_loc = $("cfg_legloc").value;
   c.grid = $("cfg_grid").checked; c.logx = $("cfg_logx").checked; c.logy = $("cfg_logy").checked;
   c.cmap = $("cfg_cmap").value;
@@ -900,6 +923,7 @@ function applyCfgWidgets() {
   const c = state.plotcfg;
   $("cfg_mode").value = c.mode; $("cfg_title").value = c.title;
   $("cfg_xlab").value = c.xlabel; $("cfg_ylab").value = c.ylabel; $("cfg_zlab").value = c.zlabel;
+  $("cfg_clabel").value = c.clabel || "";
   $("cfg_legend").checked = c.legend; $("cfg_legloc").value = c.legend_loc;
   $("cfg_grid").checked = c.grid; $("cfg_logx").checked = c.logx; $("cfg_logy").checked = c.logy;
   $("cfg_cmap").value = c.cmap;
@@ -1084,7 +1108,7 @@ function buildTabFromParsed(ptab, resolve) {
     projToNew[pi] = newtraces.length;
     newtraces.push({ file: openName, var: t.var, line_dim: ldim, sweep, slices,
       xsrc: String(t.xsrc || "index"), label: String(t.label || t.var),
-      sweep_label: String(t.sweep_label || ""),
+      sweep_label: String(t.sweep_label || ""), ssrc: String(t.ssrc || "coord"),
       yaxis: t.yaxis === "right" ? "right" : "left", visible: t.visible !== false, color });
   });
   tab.traces = newtraces;
@@ -1238,12 +1262,13 @@ function init() {
   $("ed_ldim").onchange = () => editorChanged("line_dim");
   $("ed_xsrc").onchange = () => editorChanged("xsrc");
   $("ed_sweep").onchange = () => editorChanged("sweep");
+  $("ed_ssrc").onchange = () => editorChanged("ssrc");
   $("ed_label").onchange = () => editorChanged("label");
   $("ed_sweeplabel").onchange = () => editorChanged("sweep_label");
   $("ed_yaxis").onchange = () => editorChanged("yaxis");
   $("ed_color").oninput = () => editorChanged("color");
   $("ed_autocolor").onchange = () => editorChanged("autocolor");
-  ["cfg_mode", "cfg_title", "cfg_xlab", "cfg_ylab", "cfg_zlab", "cfg_legloc",
+  ["cfg_mode", "cfg_title", "cfg_xlab", "cfg_ylab", "cfg_zlab", "cfg_clabel", "cfg_legloc",
     "cfg_cmap", "cfg_xscale", "cfg_yscale", "cfg_ylab2", "cfg_yscale2",
     "cfg_xmin", "cfg_xmax", "cfg_ymin", "cfg_ymax", "cfg_ymin2", "cfg_ymax2",
     "cfg_figw", "cfg_figh"].forEach((id) => {

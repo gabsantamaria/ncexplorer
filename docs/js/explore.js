@@ -19,7 +19,7 @@ export const PROJECT_FORMAT_V2 = "nc_explorer_project_v2";   // multi-tab, optio
 export const DEFAULT_PLOTCFG = {
   mode: "2D lines", title: "", xlabel: "", ylabel: "", zlabel: "",
   legend: true, legend_loc: "best", grid: true, logx: false, logy: false,
-  cmap: "Viridis", xunit: "", yunit: "",
+  cmap: "Viridis", clabel: "", xunit: "", yunit: "",   // clabel = colorbar caption ("" = auto)
   ylabel2: "", yunit2: "", logy2: false,      // secondary (right) y axis
   xmin: "", xmax: "", ymin: "", ymax: "",     // axis limits ("" = auto), in displayed units
   ymin2: "", ymax2: "",                       // right y axis limits
@@ -65,11 +65,12 @@ export function suggestTraces(ds, path) {
   return out;
 }
 
-export function makeTrace(file, varName, lineDim, xsrc, sweep, slices, label) {
+export function makeTrace(file, varName, lineDim, xsrc, sweep, slices, label, ssrc) {
   return {
     file, var: varName, line_dim: lineDim, xsrc, sweep: sweep || "",
     slices: { ...(slices || {}) }, label: label || varName,
     sweep_label: "", yaxis: "left", visible: true, color: "",
+    ssrc: ssrc || "coord",   // colorbar (sweep-value) source: coord | index | var:<name>
   };
 }
 
@@ -142,7 +143,9 @@ export function traceLines(ds, t, statusCb) {
     lines.push({ x: xvals({}), y: lineAlong(view, ldim, {}), sval: null });
   } else {
     const nS = ds.size(sweep);
-    const svalsCoord = ds.coordValues(sweep);
+    // colorbar values per sweep index — chosen source (coord/index/parallel var),
+    // full length nS so it stays addressed by the TRUE index i under subsampling
+    const svals = sweepSourceValues(ds, t, sweep, fixed);
     let idxs = Array.from({ length: nS }, (_, i) => i);
     if (nS > MAX_SWEEP_LINES) {
       idxs = [];
@@ -153,11 +156,51 @@ export function traceLines(ds, t, statusCb) {
     }
     for (const i of idxs) {
       const y = lineAlong(view, ldim, { [sweep]: i });
-      const sval = svalsCoord ? Number(svalsCoord[i]) : i;
+      const sval = svals ? Number(svals[i]) : i;
       lines.push({ x: xvals({ [sweep]: i }), y, sval });
     }
   }
   return { lines, sweep };
+}
+
+// the colorbar (sweep) value per sweep index: "index" -> null (use the index),
+// "var:<name>" -> a parallel variable reduced to a 1-D line along the sweep dim
+// (other dims fixed to the trace's slider slice, or 0), else the sweep dim's
+// coordinate (or null -> index). Missing/invalid ssrc falls back to coord.
+function sweepSourceValues(ds, t, sweep, fixed) {
+  const src = t.ssrc || "coord";
+  if (src === "index") return null;
+  if (src.startsWith("var:")) {
+    const name = src.slice(4);
+    const sa = ds.vars[name];
+    if (sa && sa.dims.includes(sweep)) {
+      const sfixed = {};
+      sa.dims.forEach((d) => { if (d !== sweep) sfixed[d] = (fixed[d] || 0); });
+      const sview = ds.isel(name, sfixed);
+      return asFloatArray(lineAlong(sview, sweep, {}), sa.attrs.units);
+    }
+    // invalid parallel var (e.g. after a sweep-dim change) -> coord-or-index
+  }
+  return ds.coordValues(sweep);
+}
+
+// human label for the chosen sweep source, used as the auto colorbar caption
+export function sweepSourceLabel(ds, t, sweep) {
+  const s = sweep || t.sweep;
+  if (!s) return "";
+  const src = t.ssrc || "coord";
+  if (src.startsWith("var:")) {
+    const name = src.slice(4);
+    const sa = ds && ds.vars && ds.vars[name];
+    if (sa && sa.dims.includes(s)) {
+      const u = sa.attrs && sa.attrs.units;
+      return u ? `${name} (${u})` : name;
+    }
+  }
+  if (src === "index") return `${s} (index)`;
+  const cv = ds && ds.vars && ds.vars[s];
+  const u = cv && cv.attrs && cv.attrs.units;
+  return u ? `${s} (${u})` : s;
 }
 
 export function lineLabel(t, sweep, sval, j) {

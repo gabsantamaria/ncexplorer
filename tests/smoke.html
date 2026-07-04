@@ -118,9 +118,9 @@ async function load(url) {
       fileOrder: ["a.nc", "b.nc"], active: 1,
       tabs: [
         { name: "P1", plotcfg: { mode: "2D lines", title: "one", cmap: "Turbo", figw: 999,
-            xmin: "1.5", xmax: "9", ymin: "-3" },
+            xmin: "1.5", xmax: "9", ymin: "-3", clabel: "My cbar" },
           traces: [{ file: "a.nc", var: "x", line_dim: "d", sweep: "", slices: { s: 2 },
-            xsrc: "index", label: "L", sweep_label: "", yaxis: "left", visible: true, color: "#ff0000" }],
+            xsrc: "index", ssrc: "var:foo", label: "L", sweep_label: "", yaxis: "left", visible: true, color: "#ff0000" }],
           markers: [{ trace: 0, line: 0, idx: 3 }] },
         { name: "P2", plotcfg: { mode: "Rainbow", title: "two" }, traces: [], markers: [] },
       ],
@@ -136,6 +136,8 @@ async function load(url) {
       && p.tabs[0].plotcfg.xmax === "9" && p.tabs[0].plotcfg.ymin === "-3",
       [p.tabs[0].plotcfg.xmin, p.tabs[0].plotcfg.xmax, p.tabs[0].plotcfg.ymin].join(","));
     check("proj v2 trace color preserved", p.tabs[0].traces[0].color === "#ff0000");
+    check("proj v2 colorbar label preserved", p.tabs[0].plotcfg.clabel === "My cbar", p.tabs[0].plotcfg.clabel);
+    check("proj v2 sweep source (ssrc) preserved", p.tabs[0].traces[0].ssrc === "var:foo", p.tabs[0].traces[0].ssrc);
     check("proj v2 top-level mirror = active tab", JSON.parse(json).traces.length === p.tabs[1].traces.length);
     // v1 / desktop backward-compat -> exactly one tab
     const v1 = JSON.stringify({ format: "nc_explorer_project_v1", plot: { title: "old" },
