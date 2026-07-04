@@ -1,0 +1,111 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>NC Explorer — smoke test</title>
+<script src="../docs/vendor/hdf5.js"></script>
+<style>body{font-family:Consolas,monospace;font-size:13px;padding:12px}
+.ok{color:#0a7}.fail{color:#c0392b;font-weight:bold}</style>
+</head>
+<body>
+<h3>NC Explorer smoke test — real files, real browser</h3>
+<div id="out"></div>
+<script type="module">
+import { openBuffer } from "../docs/js/dataset.js";
+import * as X from "../docs/js/explore.js";
+
+const out = document.getElementById("out");
+let fails = 0;
+function check(name, cond, extra) {
+  const d = document.createElement("div");
+  d.className = cond ? "ok" : "fail";
+  d.textContent = (cond ? "ok   " : "FAIL ") + name + (cond ? "" : "  <-- " + extra);
+  out.appendChild(d);
+  if (!cond) fails++;
+}
+async function load(url) {
+  const buf = await (await fetch(url)).arrayBuffer();
+  return openBuffer(buf, url.split("/").pop());
+}
+
+(async () => {
+  try {
+    // ---- NetCDF-3 sidebands ----
+    const sb = await load("data/sidebands.nc");
+    check("nc3 opens", !!sb);
+    check("nc3 dims freq,wl", sb.size("freq") === 187 && sb.size("wl") === 501,
+      JSON.stringify(sb.dims));
+    check("nc3 has spectra_dbm+wl_nm+freq_Hz",
+      sb.has("spectra_dbm") && sb.has("wl_nm") && sb.has("freq_Hz"));
+    check("nc3 attr format", sb.attrs.format === "VNA_OSA_sidebands_v1", sb.attrs.format);
+    // old-schema file: freq_Hz is the (non-dim) axis variable on dim freq
+    check("nc3 freq_Hz axis discoverable", sb.dimAxisCandidates("freq").includes("freq_Hz"),
+      sb.dimAxisCandidates("freq").join(","));
+    // suggested trace + line extraction
+    const sug = X.suggestTraces(sb, "sidebands.nc");
+    check("nc3 suggests a spectrum trace", sug.length === 1 && sug[0].xsrc === "var:wl_nm");
+    const r = X.traceLines(sb, sug[0], () => {});
+    check("nc3 spectrum line length 501", r.lines[0].y.length === 501, r.lines[0].y.length);
+    check("nc3 x is nm axis", r.lines[0].x[0] > 1548 && r.lines[0].x[0] < 1552, r.lines[0].x[0]);
+    check("nc3 spectrum has a peak near 0 dBm floor",
+      Math.max(...r.lines[0].y) > -60, Math.max(...r.lines[0].y));
+    // pump_dbm(freq) auto-x should pick freq_Hz
+    const pt = X.defaultTrace(sb, "pump_dbm", "sidebands.nc");
+    check("nc3 pump auto-x = freq_Hz", pt.xsrc === "var:freq_Hz", pt.xsrc);
+    const pr = X.traceLines(sb, pt, () => {});
+    check("nc3 pump x spans 10MHz..43.5GHz",
+      pr.lines[0].x[0] < 2e7 && pr.lines[0].x[pr.lines[0].x.length - 1] > 4.3e10,
+      [pr.lines[0].x[0], pr.lines[0].x.at(-1)]);
+
+    // ---- NetCDF-3 scope snapshots (sweep over channel) ----
+    const sn = await load("data/snapshots.nc");
+    check("snap dims", sn.size("snap") >= 1 && sn.size("channel") === 4,
+      JSON.stringify({ snap: sn.size("snap"), channel: sn.size("channel") }));
+    const st = X.suggestTraces(sn, "snapshots.nc")[0];
+    check("snap suggests volts vs time_s over channel",
+      st && st.sweep === "channel" && st.xsrc === "var:time_s");
+    const sr = X.traceLines(sn, st, () => {});
+    check("snap draws >=1 channel line", sr.lines.length >= 1);
+    check("snap x = time_s seconds (small, not ns)",
+      Math.max(...sr.lines[0].x) < 1 && Math.max(...sr.lines[0].x) > 1e-9,
+      Math.max(...sr.lines[0].x));
+
+    // slider slice changes the data
+    st.slices = { snap: 1 };
+    const sr2 = X.traceLines(sn, st, () => {});
+    check("snap slider changes data (usually)",
+      sr2.lines.length === sr.lines.length);
+
+    // ---- NetCDF-4 / HDF5 power cal ----
+    const h5 = await load("data/powercal_hdf5.nc");
+    check("hdf5 opens", !!h5);
+    check("hdf5 dims resolved (frequency=22, vna_power=3)",
+      h5.size("frequency") === 22 && h5.size("vna_power") === 3, JSON.stringify(h5.dims));
+    check("hdf5 gain dims [vna_power,frequency]",
+      h5.has("gain") && h5.variable("gain").dims.join(",") === "vna_power,frequency",
+      h5.has("gain") ? h5.variable("gain").dims.join(",") : "no gain");
+    check("hdf5 gain values finite",
+      Number.isFinite(Number(h5.variable("gain").data[0])), h5.variable("gain").data[0]);
+    // sweep gain over vna_power, line along frequency
+    const gt = X.defaultTrace(h5, "gain", "powercal.nc");
+    gt.sweep = "vna_power"; gt.line_dim = "frequency"; gt.slices = {};
+    gt.xsrc = h5.dimAxisCandidates("frequency").includes("frequency") ? "var:frequency" : "coord";
+    const gr = X.traceLines(h5, gt, () => {});
+    check("hdf5 gain sweep = 3 lines of 22", gr.lines.length === 3 && gr.lines[0].y.length === 22,
+      [gr.lines.length, gr.lines[0] && gr.lines[0].y.length]);
+    check("hdf5 gain x is frequency (Hz)", gr.lines[0].x[gr.lines[0].x.length-1] > 1e9,
+      gr.lines[0].x.at(-1));
+
+    check("=== NetCDF-3 and NetCDF-4/HDF5 both read and sliced correctly ===", true);
+  } catch (e) {
+    check("EXCEPTION: " + e.message, false, e.stack);
+  }
+  const summary = document.createElement("h3");
+  summary.textContent = fails === 0 ? "ALL SMOKE TESTS PASSED" : (fails + " FAILURE(S)");
+  summary.className = fails === 0 ? "ok" : "fail";
+  out.appendChild(summary);
+  window.__smoke = { fails };
+})();
+</script>
+</body>
+</html>

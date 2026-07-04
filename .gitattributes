@@ -1,0 +1,5 @@
+# NetCDF files are binary — never apply line-ending conversion
+*.nc binary
+*.nc4 binary
+# vendored minified libs: treat as binary-ish (no diff/merge, no eol munging)
+docs/vendor/* -text

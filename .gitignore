@@ -1,0 +1,10 @@
+# real lab measurement data — never commit (it stays on your machines; the app
+# reads .nc files client-side, nothing is uploaded)
+tests/data/
+data/
+
+# python / os cruft
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
