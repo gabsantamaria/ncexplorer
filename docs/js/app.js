@@ -9,6 +9,10 @@ import { cmapColor, cmapScale, CMAP_NAMES } from "./colormaps.js";
 import { buildProject, downloadProject, parseProject, triggerDownload } from "./project.js";
 
 const PX_PER_IN = 96;                 // inches -> px (fixed => consistent export)
+// qualitative palette for discrete (non-sweep) traces; index = trace position.
+// A per-trace color override (t.color) wins over this; sweep families are
+// colored by the colormap instead.
+const CYCLE = ["#1565c0", "#c0392b", "#0d6b3f", "#7d3cff", "#e6a700", "#00838f", "#ad1457", "#4e342e"];
 const state = {
   dsets: new Map(),                   // display name -> Dataset
   fileOrder: [],
@@ -26,6 +30,79 @@ const $ = (id) => document.getElementById(id);
 const gd = () => $("plot");
 function status(msg) { $("status").textContent = msg; }
 
+// ================================================================  autosave (IndexedDB)
+// Persists the whole working session — the opened files' bytes AND the project
+// (traces, cosmetics, markers, layout) — so an accidental tab close loses
+// nothing. Files go in the "files" store (ArrayBuffers), the project JSON in
+// "meta". Restored on next load.
+const DB_NAME = "ncx-session";
+function _openDB() {
+  return new Promise((resolve, reject) => {
+    let req;
+    try { req = indexedDB.open(DB_NAME, 1); }
+    catch (e) { return reject(e); }
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains("files")) db.createObjectStore("files");
+      if (!db.objectStoreNames.contains("meta")) db.createObjectStore("meta");
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+function _tx(store, mode, fn) {
+  return _openDB().then((db) => new Promise((resolve, reject) => {
+    const tx = db.transaction(store, mode);
+    const req = fn(tx.objectStore(store));   // an IDBRequest
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+    tx.onabort = () => reject(tx.error);
+  }));
+}
+const idbPut = (store, key, val) => _tx(store, "readwrite", (os) => os.put(val, key));
+const idbGet = (store, key) => _tx(store, "readonly", (os) => os.get(key));
+const idbKeys = (store) => _tx(store, "readonly", (os) => os.getAllKeys());
+const idbDel = (store, key) => _tx(store, "readwrite", (os) => os.delete(key));
+const idbClearStore = (store) => _tx(store, "readwrite", (os) => os.clear());
+
+let _saveTimer = null;
+function scheduleSave() {
+  clearTimeout(_saveTimer);
+  _saveTimer = setTimeout(() => {
+    if (!state.fileOrder.length && !state.traces.length) return;
+    idbPut("meta", "project", JSON.stringify(buildProject(state))).catch(() => {});
+  }, 600);
+}
+
+async function restoreSession() {
+  let names;
+  try { names = await idbKeys("files"); } catch (e) { return false; }
+  if (!names || !names.length) return false;
+  status("Restoring your last session…");
+  for (const name of names) {
+    try {
+      const buf = await idbGet("files", name);
+      if (!buf) continue;
+      const ds = await openBuffer(buf, name);
+      state.dsets.set(name, ds);
+      state.fileOrder.push(name);
+    } catch (e) { /* skip a file that no longer parses */ }
+  }
+  rebuildTree();
+  let projText;
+  try { projText = await idbGet("meta", "project"); } catch (e) { projText = null; }
+  if (projText) {
+    try { applyProject(parseProject(projText)); } catch (e) { /* ignore bad project */ }
+  }
+  status(`Restored ${state.fileOrder.length} file(s) and ${state.traces.length} trace(s) `
+    + "from your last session.");
+  return true;
+}
+
+async function clearSession() {
+  try { await idbClearStore("files"); await idbDel("meta", "project"); } catch (e) { /* ignore */ }
+}
+
 // =====================================================================  files
 async function openFile(file) {
   const name = file.name;
@@ -36,6 +113,7 @@ async function openFile(file) {
   catch (e) { status(`Cannot open ${name}: ${e.message}`); return null; }
   state.dsets.set(name, ds);
   state.fileOrder.push(name);
+  idbPut("files", name, buf).catch(() => {});   // persist for session restore
   rebuildTree();
   return { name, reused: false };
 }
@@ -83,6 +161,7 @@ function closeFile(name) {
   if (used && !confirm(`${used} trace(s) use ${name} and will be removed. Close it?`)) return;
   state.dsets.delete(name);
   state.fileOrder = state.fileOrder.filter((f) => f !== name);
+  idbDel("files", name).catch(() => {});
   const keep = [];
   const remap = {};
   state.traces.forEach((t, i) => { if (t.file !== name) { remap[i] = keep.length; keep.push(t); } });
@@ -244,6 +323,13 @@ function populateEditor() {
   label.value = t.label || t.var;
   swlabel.value = t.sweep_label || "";
   swlabel.disabled = !t.sweep;
+  // color: "auto" follows the qualitative cycle (by trace position); a set
+  // color overrides it. The picker still shows the effective color when auto.
+  const auto = !t.color;
+  $("ed_autocolor").checked = auto;
+  const col = $("ed_color");
+  col.value = t.color || CYCLE[state.cur % CYCLE.length];
+  col.disabled = auto;
   state._updating = false;
 }
 
@@ -277,6 +363,12 @@ function editorChanged(what) {
     if (row) row.querySelector("span").textContent = traceName(t);
   } else if (what === "sweep_label") { t.sweep_label = $("ed_sweeplabel").value; }
   else if (what === "yaxis") { t.yaxis = $("ed_yaxis").value === "right" ? "right" : "left"; }
+  else if (what === "color") { t.color = $("ed_color").value; $("ed_autocolor").checked = false; $("ed_color").disabled = false; }
+  else if (what === "autocolor") {
+    const auto = $("ed_autocolor").checked;
+    if (auto) { t.color = ""; $("ed_color").disabled = true; $("ed_color").value = CYCLE[state.cur % CYCLE.length]; }
+    else { t.color = $("ed_color").value; $("ed_color").disabled = false; }
+  }
   redraw();
 }
 
@@ -348,7 +440,7 @@ function redraw() {
   const sharedName = Object.keys(ranges).length === 1 ? Object.keys(ranges)[0] : null;
   if (Object.keys(ranges).length > 1) notes.push("traces sweep different quantities — shared colorbar suppressed");
 
-  const cycle = ["#1565c0", "#c0392b", "#0d6b3f", "#7d3cff", "#e6a700", "#00838f", "#ad1457", "#4e342e"];
+  const cycle = CYCLE;
   const data = [];
   state.drawnMap = [];
   let firstX = null;
@@ -368,7 +460,9 @@ function redraw() {
 
   for (const f of fetched) {
     const nrm = normFor(f);
-    const base = cycle[f.ti % cycle.length];
+    // per-trace color override wins; else the qualitative cycle. (A sweep
+    // family is still colored by the colormap below — normFor decides that.)
+    const base = f.t.color || cycle[f.ti % cycle.length];
     if (f.sweep && f.lines.length > 12 && c.legend && c.mode === "2D lines")
       notes.push(`'${f.t.label || f.t.var}': ${f.lines.length} sweep lines — legend omitted`);
     const yf = yfFor(f.ti);
@@ -465,6 +559,7 @@ function redraw() {
     modeBarButtonsToRemove: ["lasso2d", "select2d"],
   });
   if (notes.length) status(notes.join(" | "));
+  scheduleSave();   // autosave the session (debounced)
 }
 
 function drawMarkers(data, fetched, xf, yfFor, traceOnRight) {
@@ -651,6 +746,30 @@ function saveProject() {
   status("Project downloaded (.ncproj).");
 }
 
+// blank the whole project: drop every file + trace + marker, reset cosmetics to
+// defaults, and clear the autosaved session so nothing is restored next time.
+async function newProject() {
+  const hasWork = state.fileOrder.length || state.traces.length;
+  if (hasWork && !confirm("Start a new project? This clears all open files, traces, "
+    + "markers, and cosmetics. Save your project first if you want to keep it.")) return;
+  clearTimeout(_saveTimer);           // cancel any pending autosave of the old state
+  state.dsets.clear();
+  state.fileOrder = [];
+  state.traces = [];
+  state.markers = [];
+  state.cur = -1;
+  state.pendingProject = null;
+  state.markerMode = false;
+  $("btnMarker").classList.remove("active");
+  state.plotcfg = { ...X.DEFAULT_PLOTCFG };
+  await clearSession();               // wipe IndexedDB (files + saved project)
+  applyCfgWidgets();
+  rebuildTree();
+  rebuildTraceList(-1);
+  redraw();
+  status("New project — everything cleared. Open a .nc file to begin.");
+}
+
 async function loadProjectFile(file) {
   let proj;
   try { proj = parseProject(await file.text()); }
@@ -696,11 +815,12 @@ function applyProject(proj) {
         if (k === "__proto__" || k === "constructor") continue;
         slices[k] = Math.max(0, v | 0);
       }
+    const color = (typeof t.color === "string" && /^#[0-9a-fA-F]{6}$/.test(t.color)) ? t.color : "";
     projToNew[pi] = newtraces.length;
     newtraces.push({ file: openName, var: t.var, line_dim: ldim, sweep, slices,
       xsrc: String(t.xsrc || "index"), label: String(t.label || t.var),
       sweep_label: String(t.sweep_label || ""),
-      yaxis: t.yaxis === "right" ? "right" : "left", visible: t.visible !== false });
+      yaxis: t.yaxis === "right" ? "right" : "left", visible: t.visible !== false, color });
   });
   state.traces = newtraces;
   state.markers = (proj.markers || []).filter((m) => projToNew[m.trace] !== undefined)
@@ -806,6 +926,8 @@ function init() {
   $("ed_label").onchange = () => editorChanged("label");
   $("ed_sweeplabel").onchange = () => editorChanged("sweep_label");
   $("ed_yaxis").onchange = () => editorChanged("yaxis");
+  $("ed_color").oninput = () => editorChanged("color");
+  $("ed_autocolor").onchange = () => editorChanged("autocolor");
   ["cfg_mode", "cfg_title", "cfg_xlab", "cfg_ylab", "cfg_zlab", "cfg_legloc",
     "cfg_cmap", "cfg_xscale", "cfg_yscale", "cfg_ylab2", "cfg_yscale2",
     "cfg_figw", "cfg_figh"].forEach((id) => {
@@ -829,6 +951,7 @@ function init() {
   $("btnSaveProj").onclick = saveProject;
   $("btnLoadProj").onclick = () => $("projInput").click();
   $("projInput").onchange = (e) => { if (e.target.files[0]) loadProjectFile(e.target.files[0]); e.target.value = ""; };
+  $("btnNew").onclick = newProject;
 
   // drag & drop
   const dz = document.body;
@@ -848,6 +971,9 @@ function init() {
   gd().on("plotly_click", onPlotClick);
   gd().addEventListener("contextmenu", onPlotContext);
   status("Open a .nc file (NetCDF-3 or NetCDF-4/HDF5), or drag one in.");
+
+  // restore an autosaved session, if any, so an accidental tab close lost nothing
+  restoreSession().catch(() => {});
 }
 
 document.addEventListener("DOMContentLoaded", init);

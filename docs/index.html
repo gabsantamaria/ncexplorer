@@ -107,6 +107,12 @@
       <label>X values <select id="ed_xsrc"></select></label>
       <label>Sweep dim <select id="ed_sweep"></select></label>
       <label>Y axis <select id="ed_yaxis"></select></label>
+      <div class="row wrap">
+        <label class="chk"><input id="ed_autocolor" type="checkbox" checked /> Auto color</label>
+        <label>Color <input id="ed_color" type="color" value="#1565c0" /></label>
+      </div>
+      <p class="hint">Uncheck “Auto” to set this trace’s color. (The <b>Colormap</b> above
+        colors <i>sweep</i> families, not single traces.)</p>
       <label>Legend label <input id="ed_label" type="text" placeholder="legend text" /></label>
       <label>Sweep label <input id="ed_sweeplabel" type="text"
         placeholder="per line, e.g. T = {v} K  ({v}=value, {n}=index)" /></label>
@@ -135,6 +141,11 @@
         <button id="btnSaveProj">Save project</button>
         <button id="btnLoadProj" class="ghost">Load project</button>
       </div>
+      <div class="row">
+        <button id="btnNew" class="warn">New project (clear all)</button>
+      </div>
+      <p class="hint">Your work is auto-saved in this browser — an accidental tab close
+        won’t lose it. “New project” wipes that saved session.</p>
       <input type="file" id="projInput" accept=".ncproj,.json" hidden />
     </section>
   </aside>

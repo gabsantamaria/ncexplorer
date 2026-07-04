@@ -66,7 +66,7 @@ export function makeTrace(file, varName, lineDim, xsrc, sweep, slices, label) {
   return {
     file, var: varName, line_dim: lineDim, xsrc, sweep: sweep || "",
     slices: { ...(slices || {}) }, label: label || varName,
-    sweep_label: "", yaxis: "left", visible: true,
+    sweep_label: "", yaxis: "left", visible: true, color: "",
   };
 }
 
