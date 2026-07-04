@@ -18,6 +18,7 @@ const state = {
   plotcfg: { ...X.DEFAULT_PLOTCFG },
   markerMode: false,
   drawnMap: [],                       // curveNumber -> {ti, j} (2D only)
+  pendingProject: null,               // project awaiting its data file(s)
   _updating: false,
 };
 
@@ -48,6 +49,18 @@ async function onFilesChosen(fileList) {
   }
   const reusedNote = reused.length
     ? `  (already open, not reloaded: ${reused.join(", ")})` : "";
+  // a project was loaded earlier but was waiting for its data file — finish it
+  // now that more files are open
+  if (state.pendingProject && (opened.length || reused.length)) {
+    const still = applyProject(state.pendingProject);
+    if (!still.length) {
+      state.pendingProject = null;
+      status(`Project complete: ${state.traces.length} trace(s) drawn.`);
+      return;
+    }
+    status(`Project still needs: ${still.join(", ")} — open it too.`);
+    return;
+  }
   // auto-suggest lab-format traces only for a fresh session
   if (opened.length && state.traces.length === 0) {
     for (const nm of opened) {
@@ -596,19 +609,30 @@ async function loadProjectFile(file) {
   let proj;
   try { proj = parseProject(await file.text()); }
   catch (e) { status("Project load error: " + e.message); return; }
-  // resolve each project file reference to an OPEN dataset by BASENAME: desktop
-  // projects store absolute paths, web projects store bare names — the browser
-  // keys open files by their bare filename, so match on that (case-insensitive)
+  const still = applyProject(proj);
+  if (still.length) {
+    // can't open files by path from the browser — the user must pick the .nc.
+    // keep the project pending; cosmetics are already applied, and it finishes
+    // automatically the moment they open the referenced file.
+    state.pendingProject = proj;
+    status(`Project loaded — now click "Open .nc…" and select: ${still.join(", ")} `
+      + "to draw the traces (or drag the .nc + .ncproj in together).");
+  } else {
+    state.pendingProject = null;
+    status(`Project loaded: ${state.traces.length} trace(s).`);
+  }
+}
+
+// resolve a project's file references against OPEN datasets by BASENAME (desktop
+// projects store absolute paths; web projects store bare names). Applies the
+// cosmetics + every trace whose file is open, and RETURNS the still-missing
+// file basenames (empty when fully applied).
+function applyProject(proj) {
   const openByBase = new Map();
   for (const nm of state.fileOrder) openByBase.set(basename(nm).toLowerCase(), nm);
   const resolve = (f) => openByBase.get(basename(f).toLowerCase()) || null;
   const missing = [...new Set(proj.files.map((f) => basename(f)))]
     .filter((b) => !openByBase.has(b.toLowerCase()));
-  if (missing.length) {
-    status(`Project needs data file(s) not open: ${missing.join(", ")}. `
-      + "Open them first (drag the .nc in alongside the project), then reload.");
-    // still apply cosmetics + any traces whose file IS open
-  }
   const projToNew = {};
   const newtraces = [];
   proj.traces.forEach((t, pi) => {
@@ -634,11 +658,11 @@ async function loadProjectFile(file) {
   state.traces = newtraces;
   state.markers = (proj.markers || []).filter((m) => projToNew[m.trace] !== undefined)
     .map((m) => ({ trace: projToNew[m.trace], line: Math.max(0, m.line | 0), idx: Math.max(0, m.idx | 0) }));
-  state.plotcfg = proj.plotcfg;
+  state.plotcfg = proj.plotcfg;      // cosmetics apply even before the data opens
   applyCfgWidgets();
   rebuildTraceList(state.traces.length ? 0 : -1);
   redraw();
-  if (!missing.length) status(`Project loaded: ${state.traces.length} trace(s).`);
+  return missing;
 }
 
 // =====================================================================  helpers
