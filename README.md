@@ -55,10 +55,18 @@ The app is a static site in `docs/` — Pages serves it with no build step.
    git remote add origin https://github.com/<you>/nc-explorer.git
    git push -u origin main
    ```
-2. On GitHub: **Settings → Pages → Build and deployment → Source: Deploy from a
-   branch → Branch: `main`, folder: `/docs` → Save.**
+2. On GitHub: **Settings → Pages → Build and deployment → Source: GitHub
+   Actions.** The included workflow (`.github/workflows/deploy.yml`) publishes
+   `docs/` on every push to `main`. (Alternatively, choose **Deploy from a
+   branch → `main` / `/docs`** and delete the workflow — either works.)
 3. After a minute the app is live at
    `https://<you>.github.io/nc-explorer/`. Share that link with the lab.
+
+If a deploy fails with **"Deployment failed, try again later"**, that step is
+usually transient — **re-run the failed job** (Actions tab → the run → *Re-run
+failed jobs*) and it typically succeeds. The workflow's `concurrency` guard
+prevents overlapping deploys, which is the most common durable cause. Use only
+ONE Pages workflow; a second one that also deploys will race this one.
 
 Everything the app needs (Plotly, the HDF5 reader, the PDF exporter) is vendored
 under `docs/vendor/`, so the site is self-contained and works offline once
