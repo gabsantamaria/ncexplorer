@@ -13,7 +13,8 @@ export const PREFIX_FACTOR = {
 export const CMAPS = ["Viridis", "Plasma", "Inferno", "Turbo", "RdBu", "Rainbow"];
 export const LEGEND_LOCS = ["best", "upper right", "upper left", "lower right", "lower left"];
 export const MAX_SWEEP_LINES = 200;
-export const PROJECT_FORMAT = "nc_explorer_project_v1";
+export const PROJECT_FORMAT = "nc_explorer_project_v1";      // v1 / desktop (single plot)
+export const PROJECT_FORMAT_V2 = "nc_explorer_project_v2";   // multi-tab, optional embedded data
 
 export const DEFAULT_PLOTCFG = {
   mode: "2D lines", title: "", xlabel: "", ylabel: "", zlabel: "",

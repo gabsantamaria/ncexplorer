@@ -6,25 +6,59 @@
 import { openBuffer } from "./dataset.js";
 import * as X from "./explore.js";
 import { cmapColor, cmapScale, CMAP_NAMES } from "./colormaps.js";
-import { buildProject, downloadProject, parseProject, triggerDownload } from "./project.js";
+import { buildProject, downloadProject, parseProject, triggerDownload,
+  abToB64Chunks, b64ChunksToAb } from "./project.js";
 
 const PX_PER_IN = 96;                 // inches -> px (fixed => consistent export)
 // qualitative palette for discrete (non-sweep) traces; index = trace position.
 // A per-trace color override (t.color) wins over this; sweep families are
 // colored by the colormap instead.
 const CYCLE = ["#1565c0", "#c0392b", "#0d6b3f", "#7d3cff", "#e6a700", "#00838f", "#ad1457", "#4e342e"];
+// state splits into SHARED fields (datasets — the left panel, common to all
+// tabs) and PER-TAB fields (each tab is its own formatted plot). The per-tab
+// fields are exposed on `state` via accessors that transparently forward to the
+// ACTIVE tab, so every existing call site that reads/writes state.traces /
+// markers / cur / plotcfg / drawnMap keeps working unchanged.
 const state = {
-  dsets: new Map(),                   // display name -> Dataset
-  fileOrder: [],
-  traces: [],
-  markers: [],                        // {trace, line, idx}
-  cur: -1,
-  plotcfg: { ...X.DEFAULT_PLOTCFG },
-  markerMode: false,
-  drawnMap: [],                       // curveNumber -> {ti, j} (2D only)
-  pendingProject: null,               // project awaiting its data file(s)
-  _updating: false,
+  dsets: new Map(),                   // display name -> Dataset      (SHARED)
+  fileOrder: [],                      // SHARED
+  markerMode: false,                  // SHARED (global UI toggle)
+  pendingProject: null,               // SHARED: project awaiting its data file(s)
+  _updating: false,                   // SHARED: DOM re-entrancy guard
+  _loadingProject: false,             // SHARED: locks tab edits during embedded decode
+  tabs: [],                           // filled below
+  active: 0,
 };
+
+let _tabSeq = 0;
+function makeTab(name) {
+  return {
+    id: "t" + (++_tabSeq),
+    name: name || `Plot ${state.tabs.length + 1}`,
+    traces: [],
+    markers: [],                      // {trace, line, idx}
+    cur: -1,                          // selected trace
+    plotcfg: { ...X.DEFAULT_PLOTCFG },
+    drawnMap: [],                     // curveNumber -> {ti, j} (2D only)
+    _markerXY: [],                    // transient marker hit-test geometry
+  };
+}
+function activeTab() { return state.tabs[state.active]; }
+
+state.tabs = [makeTab("Plot 1")];
+state.active = 0;
+
+// per-tab fields proxied onto `state` -> the active tab. The setter writes
+// THROUGH, so `state.traces = []` and `state.traces.push(...)` both land on the
+// active tab. Never spread `state` (would serialize only the active tab) — the
+// project builder reads state.tabs directly.
+for (const key of ["traces", "markers", "cur", "plotcfg", "drawnMap", "_markerXY"]) {
+  Object.defineProperty(state, key, {
+    get() { const t = activeTab(); return t ? t[key] : (key === "cur" ? -1 : []); },
+    set(v) { const t = activeTab(); if (t) t[key] = v; },
+    enumerable: true, configurable: true,
+  });
+}
 
 const $ = (id) => document.getElementById(id);
 const gd = () => $("plot");
@@ -69,7 +103,9 @@ let _saveTimer = null;
 function scheduleSave() {
   clearTimeout(_saveTimer);
   _saveTimer = setTimeout(() => {
-    if (!state.fileOrder.length && !state.traces.length) return;
+    const anyTraces = state.tabs.some((tb) => tb.traces.length);
+    if (!state.fileOrder.length && !anyTraces) return;
+    // autosave never embeds — file bytes already live in the "files" store
     idbPut("meta", "project", JSON.stringify(buildProject(state))).catch(() => {});
   }, 600);
 }
@@ -92,15 +128,163 @@ async function restoreSession() {
   let projText;
   try { projText = await idbGet("meta", "project"); } catch (e) { projText = null; }
   if (projText) {
-    try { applyProject(parseProject(projText)); } catch (e) { /* ignore bad project */ }
+    try { await applyProject(parseProject(projText)); } catch (e) { /* ignore bad project */ }
   }
-  status(`Restored ${state.fileOrder.length} file(s) and ${state.traces.length} trace(s) `
+  const nTr = state.tabs.reduce((s, tb) => s + tb.traces.length, 0);
+  status(`Restored ${state.fileOrder.length} file(s), ${state.tabs.length} tab(s) and ${nTr} trace(s) `
     + "from your last session.");
   return true;
 }
 
 async function clearSession() {
   try { await idbClearStore("files"); await idbDel("meta", "project"); } catch (e) { /* ignore */ }
+}
+
+// =====================================================================  tabs
+// Each tab is its own formatted plot; the datasets (left panel) are shared. A
+// tab switch refreshes everything per-tab (cosmetics widgets, trace list,
+// editor, sliders, canvas) but never touches the shared datasets/tree.
+// while an embedded project is decoding (async), lock tab edits so a click that
+// lands during the await isn't clobbered when applyProject rebuilds state.tabs
+function setTabsBusy(on) {
+  state._loadingProject = on;
+  const bar = $("tabbar");
+  if (bar) bar.classList.toggle("busy", on);
+}
+
+function renderTabs() {
+  const bar = $("tabbar");
+  if (state._loadingProject) bar.classList.add("busy");
+  bar.innerHTML = "";
+  state.tabs.forEach((tp, i) => {
+    const el = document.createElement("div");
+    el.className = "tab" + (i === state.active ? " active" : "");
+    el.dataset.i = i;
+    const nm = document.createElement("span");
+    nm.className = "tab-name"; nm.textContent = tp.name;
+    nm.title = tp.name + " — double-click to rename · right-click for options";
+    const x = document.createElement("span");
+    x.className = "x"; x.textContent = "✕"; x.title = "close plot";
+    el.appendChild(nm); el.appendChild(x);
+    el.onclick = () => switchTab(i);
+    x.onclick = (e) => { e.stopPropagation(); closeTab(i); };
+    nm.ondblclick = (e) => { e.stopPropagation(); beginRename(i, nm); };
+    el.oncontextmenu = (e) => { e.preventDefault(); e.stopPropagation(); showTabMenu(i, e.clientX, e.clientY); };
+    bar.appendChild(el);
+  });
+  const add = document.createElement("button");
+  add.className = "tab-add"; add.textContent = "＋"; add.title = "new plot (tab)";
+  add.onclick = addTab;
+  bar.appendChild(add);
+}
+
+function addTab() {
+  if (state._loadingProject) return;
+  state.tabs.push(makeTab());
+  state.active = state.tabs.length - 1;
+  refreshTab();
+}
+
+function uniqueTabName(base) {
+  const names = new Set(state.tabs.map((t) => t.name));
+  if (!names.has(base)) return base;
+  for (let n = 2; ; n++) { const cand = `${base} ${n}`; if (!names.has(cand)) return cand; }
+}
+
+// deep-copy a tab (independent traces/markers/cosmetics), insert after it, activate
+function duplicateTab(i) {
+  if (state._loadingProject) return;
+  const src = state.tabs[i];
+  if (!src) return;
+  const copy = makeTab(uniqueTabName(src.name + " copy"));
+  copy.traces = src.traces.map((t) => ({ ...t, slices: { ...t.slices } }));
+  copy.markers = src.markers.map((m) => ({ ...m }));
+  copy.plotcfg = { ...src.plotcfg };
+  copy.cur = src.cur;
+  // drawnMap/_markerXY are transient — redraw rebuilds them for the copy
+  state.tabs.splice(i + 1, 0, copy);
+  state.active = i + 1;
+  refreshTab();
+}
+
+// right-click menu on a tab: Duplicate / Rename / Close
+let _tabMenu = null;
+function closeTabMenu() {
+  if (!_tabMenu) return;
+  _tabMenu.remove(); _tabMenu = null;
+  document.removeEventListener("mousedown", onTabMenuOutside, true);
+  document.removeEventListener("keydown", onTabMenuKey, true);
+  window.removeEventListener("blur", closeTabMenu);
+}
+function onTabMenuOutside(e) { if (_tabMenu && !_tabMenu.contains(e.target)) closeTabMenu(); }
+function onTabMenuKey(e) { if (e.key === "Escape") closeTabMenu(); }
+
+function showTabMenu(i, x, y) {
+  closeTabMenu();
+  const menu = document.createElement("div");
+  menu.className = "ctxmenu";
+  const item = (label, fn) => {
+    const b = document.createElement("button");
+    b.textContent = label;
+    b.onclick = () => { closeTabMenu(); fn(); };
+    menu.appendChild(b);
+  };
+  item("Duplicate", () => duplicateTab(i));
+  item("Rename…", () => { const el = $("tabbar").querySelectorAll(".tab-name")[i]; if (el) beginRename(i, el); });
+  item("Close", () => closeTab(i));
+  document.body.appendChild(menu);
+  _tabMenu = menu;
+  // clamp to the viewport so the menu never spills off-screen
+  const r = menu.getBoundingClientRect();
+  menu.style.left = Math.max(2, Math.min(x, window.innerWidth - r.width - 4)) + "px";
+  menu.style.top = Math.max(2, Math.min(y, window.innerHeight - r.height - 4)) + "px";
+  document.addEventListener("mousedown", onTabMenuOutside, true);
+  document.addEventListener("keydown", onTabMenuKey, true);
+  window.addEventListener("blur", closeTabMenu);
+}
+
+function switchTab(i) {
+  if (state._loadingProject) return;
+  if (i === state.active || i < 0 || i >= state.tabs.length) return;
+  state.active = i;
+  refreshTab();
+}
+
+function beginRename(i, span) {
+  if (state._loadingProject) return;
+  const inp = document.createElement("input");
+  inp.type = "text"; inp.value = state.tabs[i].name; inp.className = "tab-rename";
+  span.replaceWith(inp); inp.focus(); inp.select();
+  let done = false;
+  const commit = (save) => {
+    if (done) return; done = true;
+    if (save) { const v = inp.value.trim().slice(0, 80); if (v) state.tabs[i].name = v; }
+    renderTabs(); scheduleSave();
+  };
+  inp.onkeydown = (e) => { if (e.key === "Enter") commit(true); else if (e.key === "Escape") commit(false); };
+  inp.onblur = () => commit(true);
+}
+
+function closeTab(i) {
+  if (state._loadingProject) return;
+  const tp = state.tabs[i];
+  if ((tp.traces.length || tp.markers.length)
+      && !confirm(`Close "${tp.name}"? Its ${tp.traces.length} trace(s) will be discarded.`)) return;
+  if (state.tabs.length === 1) { state.tabs = [makeTab("Plot 1")]; state.active = 0; }
+  else {
+    state.tabs.splice(i, 1);
+    if (state.active > i) state.active--;
+    state.active = Math.max(0, Math.min(state.active, state.tabs.length - 1));
+  }
+  refreshTab();
+}
+
+// the single "a tab switch refreshes EVERYTHING per-tab" routine
+function refreshTab() {
+  renderTabs();
+  applyCfgWidgets();     // cosmetics widgets <- active tab's plotcfg
+  rebuildTraceList(activeTab().cur >= 0 ? activeTab().cur : (state.traces.length ? 0 : -1));
+  redraw();              // repaints #plot and fires scheduleSave
 }
 
 // =====================================================================  files
@@ -130,10 +314,11 @@ async function onFilesChosen(fileList) {
   // a project was loaded earlier but was waiting for its data file — finish it
   // now that more files are open
   if (state.pendingProject && (opened.length || reused.length)) {
-    const still = applyProject(state.pendingProject);
+    const still = await applyProject(state.pendingProject);
     if (!still.length) {
       state.pendingProject = null;
-      status(`Project complete: ${state.traces.length} trace(s) drawn.`);
+      const nTr = state.tabs.reduce((s, tb) => s + tb.traces.length, 0);
+      status(`Project complete: ${state.tabs.length} tab(s), ${nTr} trace(s) drawn.`);
       return;
     }
     status(`Project still needs: ${still.join(", ")} — open it too.`);
@@ -156,25 +341,29 @@ async function onFilesChosen(fileList) {
   status(`${head}${reusedNote} Pick a variable and "Add trace".`);
 }
 
+// drop every trace referencing `name` from ONE tab, remapping its markers and
+// selected-trace index against that tab's own before/after trace order
+function pruneFileFromTab(tp, name) {
+  const keep = [], remap = {};
+  tp.traces.forEach((t, i) => { if (t.file !== name) { remap[i] = keep.length; keep.push(t); } });
+  tp.markers = tp.markers.filter((m) => remap[m.trace] !== undefined)
+    .map((m) => ({ ...m, trace: remap[m.trace] }));
+  tp.cur = keep.length
+    ? (remap[tp.cur] !== undefined ? remap[tp.cur] : Math.min(tp.cur, keep.length - 1))
+    : -1;
+  tp.traces = keep;
+}
+
 function closeFile(name) {
-  const used = state.traces.filter((t) => t.file === name).length;
-  if (used && !confirm(`${used} trace(s) use ${name} and will be removed. Close it?`)) return;
+  // datasets are shared: a closed file's traces must be purged from EVERY tab
+  const used = state.tabs.reduce((s, tb) => s + tb.traces.filter((t) => t.file === name).length, 0);
+  if (used && !confirm(`${used} trace(s) across all tabs use ${name} and will be removed. Close it?`)) return;
   state.dsets.delete(name);
   state.fileOrder = state.fileOrder.filter((f) => f !== name);
   idbDel("files", name).catch(() => {});
-  const keep = [];
-  const remap = {};
-  state.traces.forEach((t, i) => { if (t.file !== name) { remap[i] = keep.length; keep.push(t); } });
-  state.markers = state.markers.filter((m) => remap[m.trace] !== undefined)
-    .map((m) => ({ ...m, trace: remap[m.trace] }));
-  state.traces = keep;
+  state.tabs.forEach((tp) => pruneFileFromTab(tp, name));
   rebuildTree();
-  // preserve the selected trace's identity when it survived; else clamp
-  const newCur = state.traces.length
-    ? (remap[state.cur] !== undefined ? remap[state.cur]
-       : Math.min(state.cur, state.traces.length - 1))
-    : -1;
-  rebuildTraceList(newCur);
+  rebuildTraceList(activeTab().cur);   // active tab's already-remapped selection
   redraw();
 }
 
@@ -743,26 +932,57 @@ function exportCSV() {
 function saveProject() {
   if (!state.fileOrder.length) { status("Nothing to save yet."); return; }
   downloadProject(state, "ncplot_" + stamp() + ".ncproj");
-  status("Project downloaded (.ncproj).");
+  status(`Project downloaded — ${state.tabs.length} tab(s); .nc files referenced by name.`);
+}
+
+// self-contained save: bundle every open file's bytes into the .ncproj as
+// base64. Bytes come from the IndexedDB "files" store (no re-read of the File).
+async function saveProjectEmbedded() {
+  if (!state.fileOrder.length) { status("Nothing to save yet."); return; }
+  status("Bundling .nc data into the project…");
+  const files = {};
+  let total = 0;
+  for (const name of state.fileOrder) {
+    let buf = null;
+    try { buf = await idbGet("files", name); } catch (e) { /* ignore */ }
+    if (!buf) continue;
+    total += buf.byteLength;
+    files[name] = { size: buf.byteLength, chunks: abToB64Chunks(buf) };
+  }
+  if (!Object.keys(files).length) {
+    status("Could not read file bytes to embed — saved a name-referenced project instead.");
+    downloadProject(state, "ncplot_" + stamp() + ".ncproj");
+    return;
+  }
+  const mb = total / 1e6;
+  if (total > 200e6 && !confirm(`Embedding ~${mb.toFixed(0)} MB of data makes a ~${(mb * 1.4).toFixed(0)} MB `
+    + "project file. Continue?")) { status("Save cancelled."); return; }
+  downloadProject(state, "ncplot_" + stamp() + ".ncproj", { embedded: { encoding: "base64", files } });
+  status(`Self-contained project downloaded — ${state.tabs.length} tab(s), ~${mb.toFixed(1)} MB embedded.`);
+}
+
+function onSaveProject() {
+  if ($("chk_embed") && $("chk_embed").checked) saveProjectEmbedded();
+  else saveProject();
 }
 
 // blank the whole project: drop every file + trace + marker, reset cosmetics to
 // defaults, and clear the autosaved session so nothing is restored next time.
 async function newProject() {
-  const hasWork = state.fileOrder.length || state.traces.length;
-  if (hasWork && !confirm("Start a new project? This clears all open files, traces, "
+  const anyTraces = state.tabs.some((tb) => tb.traces.length);
+  const hasWork = state.fileOrder.length || anyTraces;
+  if (hasWork && !confirm("Start a new project? This clears all open files, every tab, "
     + "markers, and cosmetics. Save your project first if you want to keep it.")) return;
   clearTimeout(_saveTimer);           // cancel any pending autosave of the old state
   state.dsets.clear();
   state.fileOrder = [];
-  state.traces = [];
-  state.markers = [];
-  state.cur = -1;
   state.pendingProject = null;
   state.markerMode = false;
   $("btnMarker").classList.remove("active");
-  state.plotcfg = { ...X.DEFAULT_PLOTCFG };
+  state.tabs = [makeTab("Plot 1")];   // one fresh empty tab
+  state.active = 0;
   await clearSession();               // wipe IndexedDB (files + saved project)
+  renderTabs();
   applyCfgWidgets();
   rebuildTree();
   rebuildTraceList(-1);
@@ -774,33 +994,28 @@ async function loadProjectFile(file) {
   let proj;
   try { proj = parseProject(await file.text()); }
   catch (e) { status("Project load error: " + e.message); return; }
-  const still = applyProject(proj);
+  const still = await applyProject(proj);
+  const nTr = state.tabs.reduce((s, tb) => s + tb.traces.length, 0);
   if (still.length) {
     // can't open files by path from the browser — the user must pick the .nc.
-    // keep the project pending; cosmetics are already applied, and it finishes
-    // automatically the moment they open the referenced file.
+    // keep the project pending; cosmetics/tabs are already applied, and it
+    // finishes automatically the moment they open the referenced file.
     state.pendingProject = proj;
-    status(`Project loaded — now click "Open .nc…" and select: ${still.join(", ")} `
-      + "to draw the traces (or drag the .nc + .ncproj in together).");
+    status(`Project loaded (${state.tabs.length} tab(s)) — now click "Open .nc…" and select: `
+      + `${still.join(", ")} to draw the remaining traces (or drag the .nc + .ncproj in together).`);
   } else {
     state.pendingProject = null;
-    status(`Project loaded: ${state.traces.length} trace(s).`);
+    status(`Project loaded: ${state.tabs.length} tab(s), ${nTr} trace(s).`);
   }
 }
 
-// resolve a project's file references against OPEN datasets by BASENAME (desktop
-// projects store absolute paths; web projects store bare names). Applies the
-// cosmetics + every trace whose file is open, and RETURNS the still-missing
-// file basenames (empty when fully applied).
-function applyProject(proj) {
-  const openByBase = new Map();
-  for (const nm of state.fileOrder) openByBase.set(basename(nm).toLowerCase(), nm);
-  const resolve = (f) => openByBase.get(basename(f).toLowerCase()) || null;
-  const missing = [...new Set(proj.files.map((f) => basename(f)))]
-    .filter((b) => !openByBase.has(b.toLowerCase()));
+// build one live tab record from a parsed project tab, resolving each trace's
+// file against OPEN datasets by basename (skipping traces whose file isn't open)
+function buildTabFromParsed(ptab, resolve) {
+  const tab = makeTab(ptab.name);
   const projToNew = {};
   const newtraces = [];
-  proj.traces.forEach((t, pi) => {
+  ptab.traces.forEach((t, pi) => {
     const openName = resolve(t.file);
     const ds = openName && state.dsets.get(openName);
     if (!ds || !ds.has(t.var)) return;
@@ -822,14 +1037,63 @@ function applyProject(proj) {
       sweep_label: String(t.sweep_label || ""),
       yaxis: t.yaxis === "right" ? "right" : "left", visible: t.visible !== false, color });
   });
-  state.traces = newtraces;
-  state.markers = (proj.markers || []).filter((m) => projToNew[m.trace] !== undefined)
+  tab.traces = newtraces;
+  tab.markers = (ptab.markers || []).filter((m) => projToNew[m.trace] !== undefined)
     .map((m) => ({ trace: projToNew[m.trace], line: Math.max(0, m.line | 0), idx: Math.max(0, m.idx | 0) }));
-  state.plotcfg = proj.plotcfg;      // cosmetics apply even before the data opens
-  applyCfgWidgets();
-  rebuildTraceList(state.traces.length ? 0 : -1);
-  redraw();
-  return missing;
+  tab.plotcfg = ptab.plotcfg;        // cosmetics apply even before the data opens
+  tab.cur = tab.traces.length ? 0 : -1;
+  return tab;
+}
+
+// apply a parsed project: decode any embedded files, rebuild ALL tabs resolving
+// file refs by BASENAME against open datasets (desktop projects store absolute
+// paths, web store bare names), and RETURN the still-missing file basenames
+// (empty when fully applied). Async because embedded HDF5 decode awaits WASM.
+async function applyProject(proj) {
+  const hasEmbed = proj.embedded && proj.embedded.files && typeof proj.embedded.files === "object";
+  // lock tab edits while embedded files decode (the only async window) so a
+  // click landing during the await isn't discarded by the wholesale rebuild
+  if (hasEmbed) setTabsBusy(true);
+  try {
+    // 1) decode + register embedded files that aren't already open
+    if (hasEmbed) {
+      const openBase = new Map(state.fileOrder.map((nm) => [basename(nm).toLowerCase(), nm]));
+      for (const [name, entry] of Object.entries(proj.embedded.files)) {
+        if (name === "__proto__" || name === "constructor") continue;
+        const base = basename(name).toLowerCase();
+        if (openBase.has(base)) continue;               // already open — keep it
+        if (!entry) continue;
+        const sz = Number(entry.size);                  // real compare (not int32 |0)
+        if (Number.isFinite(sz) && sz > 2e9) continue;  // refuse absurd declared sizes
+        try {
+          const buf = b64ChunksToAb(entry);
+          const ds = await openBuffer(buf, name);       // HDF5 path is async (WASM)
+          state.dsets.set(name, ds);
+          state.fileOrder.push(name);
+          openBase.set(base, name);
+          idbPut("files", name, buf).catch(() => {});   // persist so autosave restores it
+        } catch (e) { /* skip a corrupt embedded file; its traces stay missing */ }
+      }
+      rebuildTree();
+    }
+
+    // 2) resolve refs against open datasets
+    const openByBase = new Map();
+    for (const nm of state.fileOrder) openByBase.set(basename(nm).toLowerCase(), nm);
+    const resolve = (f) => openByBase.get(basename(f).toLowerCase()) || null;
+    const missing = [...new Set(proj.files.map((f) => basename(f)))]
+      .filter((b) => !openByBase.has(b.toLowerCase()));
+
+    // 3) rebuild every tab wholesale (idempotent — re-runnable when files open)
+    const built = proj.tabs.map((pt) => buildTabFromParsed(pt, resolve));
+    state.tabs = built.length ? built : [makeTab("Plot 1")];
+    state.active = Math.max(0, Math.min(proj.active | 0, state.tabs.length - 1));
+
+    refreshTab();     // renderTabs + applyCfgWidgets + rebuildTraceList + redraw
+    return missing;
+  } finally {
+    if (hasEmbed) setTabsBusy(false);
+  }
 }
 
 // =====================================================================  helpers
@@ -914,6 +1178,7 @@ function init() {
   addOpts($("cfg_yscale"), X.UNIT_PREFIXES, "—");
   addOpts($("cfg_yscale2"), X.UNIT_PREFIXES, "—");
   applyCfgWidgets();
+  renderTabs();
 
   $("btnOpen").onclick = () => $("fileInput").click();
   $("fileInput").onchange = (e) => { onFilesChosen(e.target.files); e.target.value = ""; };
@@ -948,7 +1213,7 @@ function init() {
   $("btnSVG").onclick = () => exportImage("svg");
   $("btnPDF").onclick = exportPDF;
   $("btnCSV").onclick = exportCSV;
-  $("btnSaveProj").onclick = saveProject;
+  $("btnSaveProj").onclick = onSaveProject;
   $("btnLoadProj").onclick = () => $("projInput").click();
   $("projInput").onchange = (e) => { if (e.target.files[0]) loadProjectFile(e.target.files[0]); e.target.value = ""; };
   $("btnNew").onclick = newProject;
@@ -987,4 +1252,5 @@ if ("serviceWorker" in navigator) {
 }
 
 // expose for a tiny in-page smoke test (see tests/smoke.html)
-window.__ncx = { state, redraw, X, openBuffer, onFilesChosen };
+window.__ncx = { state, redraw, X, openBuffer, onFilesChosen,
+  addTab, switchTab, closeTab, duplicateTab, applyProject, buildProject, parseProject };

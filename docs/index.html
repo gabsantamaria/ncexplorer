@@ -42,8 +42,9 @@
 
   <div class="splitter" id="splitL" title="drag to resize · double-click to reset"></div>
 
-  <!-- CENTER: plot -->
+  <!-- CENTER: tabs + plot -->
   <main id="center">
+    <div id="tabbar" class="tabbar" title="each tab is its own formatted plot; datasets on the left are shared"></div>
     <div id="plotWrap"><div id="plot"></div></div>
   </main>
 
@@ -137,6 +138,7 @@
         <button id="btnPDF" class="ghost">PDF</button>
         <button id="btnCSV" class="ghost">CSV</button>
       </div>
+      <label class="chk"><input id="chk_embed" type="checkbox" /> Embed .nc data in the project file (self-contained)</label>
       <div class="row">
         <button id="btnSaveProj">Save project</button>
         <button id="btnLoadProj" class="ghost">Load project</button>
@@ -144,8 +146,9 @@
       <div class="row">
         <button id="btnNew" class="warn">New project (clear all)</button>
       </div>
-      <p class="hint">Your work is auto-saved in this browser — an accidental tab close
-        won’t lose it. “New project” wipes that saved session.</p>
+      <p class="hint">Every tab is saved in the project. Tick “Embed” to bundle the .nc files
+        inside it (one shareable, self-contained file — larger). Your work is also auto-saved
+        in this browser; “New project” wipes that saved session.</p>
       <input type="file" id="projInput" accept=".ncproj,.json" hidden />
     </section>
   </aside>

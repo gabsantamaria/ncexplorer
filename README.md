@@ -22,19 +22,28 @@ browser. Nothing is sent anywhere.
 - **Combine traces** from any number of files on one plot: **2D lines**,
   **Rainbow** (a sweep family colored by a colormap + colorbar), or **3D
   waterfall**.
+- **Tabs — many plots, one project**: each tab is its own independently-formatted
+  plot (its own traces, cosmetics, markers, sliders), while the **datasets on the
+  left are shared** across all tabs. Add (`＋`), rename (double-click), close, and
+  **right-click a tab → Duplicate** to fork a formatted plot and tweak the copy.
 - **Cosmetics** you can edit before export: title, axis labels, per-trace legend
-  labels, per-line **sweep-label templates** (`T = {v} K`), legend location,
-  grid, log axes, colormap, and **SI unit scaling** (k/M/G/T/m/µ/n/p) on both
-  axes (labels and CSV follow).
+  labels, **per-trace color**, per-line **sweep-label templates** (`T = {v} K`),
+  legend location, grid, log axes, colormap, and **SI unit scaling**
+  (k/M/G/T/m/µ/n/p) on both axes (labels and CSV follow).
 - **Markers** that attach to trace data points and **follow the sliders** —
   left-click to add, right-click to delete.
 - **Fixed plot size** (lock to N inches) so exported text is the same size no
   matter how big the browser window is.
 - **Export** the figure as **PNG / SVG / vector PDF**, or the plotted data as
   **CSV**.
-- **Projects** (`.ncproj`, plain JSON): save the whole visualization — files,
-  traces, slicing, cosmetics, markers, plot size — and reload it later (drag the
-  `.ncproj` back in). Data files are referenced by name; re-open them alongside.
+- **Projects** (`.ncproj`, plain JSON): save the whole visualization — **every
+  tab**, its traces, slicing, cosmetics, per-trace colors, markers, and plot size
+  — and reload it later (drag the `.ncproj` back in). Data files are referenced by
+  name; re-open them alongside. Tick **“Embed .nc data”** to bundle the file bytes
+  into the project so it is a single **self-contained, shareable file** (larger).
+- **Never lose work**: the session (open files + all tabs) is **auto-saved in your
+  browser**, so an accidental tab close restores on the next visit. **New project**
+  clears everything.
 
 Recognized lab formats (`DHO924S_snapshots_v1`, `VNA_OSA_sidebands_v1`) get
 sensible default traces on open.
