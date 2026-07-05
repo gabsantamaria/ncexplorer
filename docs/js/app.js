@@ -1256,6 +1256,21 @@ function initSplitters() {
   drag($("splitR"), "right");
 }
 
+// collapse/expand the bottom appearance bar; state persists and the plot reflows
+function setAppearanceCollapsed(collapsed) {
+  $("appearance").classList.toggle("collapsed", collapsed);
+  $("appToggle").textContent = (collapsed ? "▸" : "▾") + " Appearance";
+  try { localStorage.setItem("ncx.appCollapsed", collapsed ? "1" : "0"); } catch (e) {}
+  try { Plotly.Plots.resize(gd()); } catch (e) { /* not drawn yet */ }
+}
+function initAppearanceBar() {
+  $("appToggle").onclick = () =>
+    setAppearanceCollapsed(!$("appearance").classList.contains("collapsed"));
+  let collapsed = false;
+  try { collapsed = localStorage.getItem("ncx.appCollapsed") === "1"; } catch (e) {}
+  setAppearanceCollapsed(collapsed);
+}
+
 // =====================================================================  wiring
 function init() {
   // populate static selects
@@ -1293,6 +1308,7 @@ function init() {
     $(id).onchange = cfgChanged;
   });
   initSplitters();
+  initAppearanceBar();
   $("btnMarker").onclick = () => {
     state.markerMode = !state.markerMode;
     $("btnMarker").classList.toggle("active", state.markerMode);

@@ -23,7 +23,7 @@
 </header>
 
 <div id="layout">
-  <!-- LEFT: datasets + variables + info -->
+  <!-- LEFT: datasets + info + export/project -->
   <aside id="left">
     <section class="panel">
       <h2>Datasets</h2>
@@ -38,116 +38,6 @@
       <h2>Info</h2>
       <pre id="info" class="info"></pre>
     </section>
-  </aside>
-
-  <div class="splitter" id="splitL" title="drag to resize · double-click to reset"></div>
-
-  <!-- CENTER: tabs + plot -->
-  <main id="center">
-    <div id="tabbar" class="tabbar" title="each tab is its own formatted plot; datasets on the left are shared"></div>
-    <div id="plotWrap"><div id="plot"></div></div>
-  </main>
-
-  <div class="splitter" id="splitR" title="drag to resize · double-click to reset"></div>
-
-  <!-- RIGHT: controls -->
-  <aside id="right">
-    <section class="panel">
-      <h2>Plot</h2>
-      <label>Mode <select id="cfg_mode"></select></label>
-      <label>Title <input id="cfg_title" type="text" placeholder="—" /></label>
-      <label>X label <input id="cfg_xlab" type="text" placeholder="auto" /></label>
-      <label>Y label <input id="cfg_ylab" type="text" placeholder="auto" /></label>
-      <label>Z label <input id="cfg_zlab" type="text" placeholder="auto (3D)" /></label>
-      <div class="row wrap">
-        <label class="chk"><input id="cfg_legend" type="checkbox" checked /> Legend</label>
-        <select id="cfg_legloc"></select>
-      </div>
-      <div class="row wrap">
-        <label class="chk"><input id="cfg_grid" type="checkbox" checked /> Grid</label>
-        <label class="chk"><input id="cfg_logx" type="checkbox" /> log X</label>
-        <label class="chk"><input id="cfg_logy" type="checkbox" /> log Y</label>
-      </div>
-      <div class="row">
-        <label>X ÷ <select id="cfg_xscale"></select></label>
-        <label>Y ÷ <select id="cfg_yscale"></select></label>
-      </div>
-      <label>Colormap <select id="cfg_cmap"></select></label>
-      <label>Colorbar label <input id="cfg_clabel" type="text" placeholder="auto (sweep values)" /></label>
-      <label>Colorbar ÷ <select id="cfg_cscale"></select></label>
-      <div class="sub-h">Axis limits (blank = auto)</div>
-      <div class="row">
-        <label>X min <input id="cfg_xmin" type="number" step="any" placeholder="auto" /></label>
-        <label>X max <input id="cfg_xmax" type="number" step="any" placeholder="auto" /></label>
-      </div>
-      <div class="row">
-        <label>Y min <input id="cfg_ymin" type="number" step="any" placeholder="auto" /></label>
-        <label>Y max <input id="cfg_ymax" type="number" step="any" placeholder="auto" /></label>
-      </div>
-      <p class="hint">In displayed units (after any ÷ scaling). Set one side only to fix
-        just that end. 2D views only.</p>
-      <div class="sub-h">Right Y axis (secondary)</div>
-      <label>Right Y label <input id="cfg_ylab2" type="text" placeholder="auto" /></label>
-      <div class="row wrap">
-        <label>Right Y ÷ <select id="cfg_yscale2"></select></label>
-        <label class="chk"><input id="cfg_logy2" type="checkbox" /> log</label>
-      </div>
-      <div class="row">
-        <label>Right Y min <input id="cfg_ymin2" type="number" step="any" placeholder="auto" /></label>
-        <label>Right Y max <input id="cfg_ymax2" type="number" step="any" placeholder="auto" /></label>
-      </div>
-      <p class="hint">assign a trace to the right axis in “Selected trace → Y axis”.</p>
-    </section>
-
-    <section class="panel">
-      <h2>Plot size (fixed export)</h2>
-      <label class="chk"><input id="cfg_lock" type="checkbox" /> Lock plot size</label>
-      <div class="row">
-        <label>W <input id="cfg_figw" type="number" min="2" max="40" step="0.5" value="8" /> in</label>
-        <label>H <input id="cfg_figh" type="number" min="2" max="40" step="0.5" value="5.2" /> in</label>
-      </div>
-      <p class="hint">Locked → the figure stays this many inches, so exported font size never
-        changes with the browser window.</p>
-    </section>
-
-    <section class="panel">
-      <h2>Traces</h2>
-      <div id="traceList" class="trace-list"></div>
-      <div class="row">
-        <button id="btnRemove" class="ghost">Remove</button>
-        <button id="btnClear" class="warn">Clear all</button>
-      </div>
-    </section>
-
-    <section class="panel" id="editor">
-      <h2>Selected trace</h2>
-      <label>Line along <select id="ed_ldim"></select></label>
-      <label>X values <select id="ed_xsrc"></select></label>
-      <label>Sweep dim <select id="ed_sweep"></select></label>
-      <label>Sweep values <select id="ed_ssrc"></select></label>
-      <label>Y axis <select id="ed_yaxis"></select></label>
-      <div class="row wrap">
-        <label class="chk"><input id="ed_autocolor" type="checkbox" checked /> Auto color</label>
-        <label>Color <input id="ed_color" type="color" value="#1565c0" /></label>
-      </div>
-      <p class="hint">Uncheck “Auto” to set this trace’s color. (The <b>Colormap</b> above
-        colors <i>sweep</i> families, not single traces.)</p>
-      <label>Legend label <input id="ed_label" type="text" placeholder="legend text" /></label>
-      <label>Sweep label <input id="ed_sweeplabel" type="text"
-        placeholder="per line, e.g. T = {v} K  ({v}=value, {n}=index)" /></label>
-      <div class="sub-h">Sliders (slice the other dims)</div>
-      <div id="sliders" class="sliders"></div>
-    </section>
-
-    <section class="panel">
-      <h2>Markers</h2>
-      <div class="row">
-        <button id="btnMarker" class="ghost">📍 Marker mode</button>
-        <button id="btnMarkerClear" class="ghost">Clear</button>
-      </div>
-      <p class="hint">left-click a point to add · right-click a marker to delete · they follow the sliders</p>
-    </section>
-
     <section class="panel">
       <h2>Export / project</h2>
       <div class="row wrap">
@@ -168,6 +58,131 @@
         inside it (one shareable, self-contained file — larger). Your work is also auto-saved
         in this browser; “New project” wipes that saved session.</p>
       <input type="file" id="projInput" accept=".ncproj,.json" hidden />
+    </section>
+  </aside>
+
+  <div class="splitter" id="splitL" title="drag to resize · double-click to reset"></div>
+
+  <!-- CENTER: tabs + plot + appearance -->
+  <main id="center">
+    <div id="tabbar" class="tabbar" title="each tab is its own formatted plot; datasets on the left are shared"></div>
+    <div id="plotWrap"><div id="plot"></div></div>
+
+    <!-- appearance controls for the ACTIVE plot (per tab); collapsible -->
+    <section id="appearance" class="appbar">
+      <div class="appbar-head">
+        <button id="appToggle" class="appbar-toggle" title="show / hide the appearance controls">▾ Appearance</button>
+        <span class="appbar-hint">how the active plot looks — saved per tab</span>
+      </div>
+      <div class="appbar-body">
+        <div class="app-group">
+          <div class="app-title">View</div>
+          <label>Mode <select id="cfg_mode"></select></label>
+          <label>Colormap <select id="cfg_cmap"></select></label>
+        </div>
+        <div class="app-group">
+          <div class="app-title">Labels</div>
+          <label>Title <input id="cfg_title" type="text" placeholder="—" /></label>
+          <label>X label <input id="cfg_xlab" type="text" placeholder="auto" /></label>
+          <label>Y label <input id="cfg_ylab" type="text" placeholder="auto" /></label>
+          <label>Z label <input id="cfg_zlab" type="text" placeholder="auto (3D)" /></label>
+        </div>
+        <div class="app-group">
+          <div class="app-title">Legend &amp; axes</div>
+          <div class="row wrap">
+            <label class="chk"><input id="cfg_legend" type="checkbox" checked /> Legend</label>
+            <select id="cfg_legloc"></select>
+          </div>
+          <div class="row wrap">
+            <label class="chk"><input id="cfg_grid" type="checkbox" checked /> Grid</label>
+            <label class="chk"><input id="cfg_logx" type="checkbox" /> log X</label>
+            <label class="chk"><input id="cfg_logy" type="checkbox" /> log Y</label>
+          </div>
+          <div class="row">
+            <label>X ÷ <select id="cfg_xscale"></select></label>
+            <label>Y ÷ <select id="cfg_yscale"></select></label>
+          </div>
+        </div>
+        <div class="app-group">
+          <div class="app-title">Limits (blank = auto)</div>
+          <div class="row">
+            <label>X min <input id="cfg_xmin" type="number" step="any" placeholder="auto" /></label>
+            <label>X max <input id="cfg_xmax" type="number" step="any" placeholder="auto" /></label>
+          </div>
+          <div class="row">
+            <label>Y min <input id="cfg_ymin" type="number" step="any" placeholder="auto" /></label>
+            <label>Y max <input id="cfg_ymax" type="number" step="any" placeholder="auto" /></label>
+          </div>
+        </div>
+        <div class="app-group">
+          <div class="app-title">Colorbar (sweeps)</div>
+          <label>Label <input id="cfg_clabel" type="text" placeholder="auto (sweep values)" /></label>
+          <label>÷ <select id="cfg_cscale"></select></label>
+        </div>
+        <div class="app-group">
+          <div class="app-title">Right Y axis</div>
+          <label>Label <input id="cfg_ylab2" type="text" placeholder="auto" /></label>
+          <div class="row wrap">
+            <label>÷ <select id="cfg_yscale2"></select></label>
+            <label class="chk"><input id="cfg_logy2" type="checkbox" /> log</label>
+          </div>
+          <div class="row">
+            <label>min <input id="cfg_ymin2" type="number" step="any" placeholder="auto" /></label>
+            <label>max <input id="cfg_ymax2" type="number" step="any" placeholder="auto" /></label>
+          </div>
+        </div>
+        <div class="app-group">
+          <div class="app-title">Size (fixed export)</div>
+          <label class="chk"><input id="cfg_lock" type="checkbox" /> Lock plot size</label>
+          <div class="row">
+            <label>W <input id="cfg_figw" type="number" min="2" max="40" step="0.5" value="8" /> in</label>
+            <label>H <input id="cfg_figh" type="number" min="2" max="40" step="0.5" value="5.2" /> in</label>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <div class="splitter" id="splitR" title="drag to resize · double-click to reset"></div>
+
+  <!-- RIGHT: traces + selected trace + markers -->
+  <aside id="right">
+    <section class="panel">
+      <h2>Traces</h2>
+      <div id="traceList" class="trace-list"></div>
+      <div class="row">
+        <button id="btnRemove" class="ghost">Remove</button>
+        <button id="btnClear" class="warn">Clear all</button>
+      </div>
+    </section>
+
+    <section class="panel" id="editor">
+      <h2>Selected trace</h2>
+      <label>Line along <select id="ed_ldim"></select></label>
+      <label>X values <select id="ed_xsrc"></select></label>
+      <label>Sweep dim <select id="ed_sweep"></select></label>
+      <label>Sweep values <select id="ed_ssrc"></select></label>
+      <label>Y axis <select id="ed_yaxis"></select></label>
+      <div class="row wrap">
+        <label class="chk"><input id="ed_autocolor" type="checkbox" checked /> Auto color</label>
+        <label>Color <input id="ed_color" type="color" value="#1565c0" /></label>
+      </div>
+      <p class="hint">Uncheck “Auto” to set this trace’s color. (The <b>Colormap</b>
+        colors <i>sweep</i> families, not single traces.)</p>
+      <label>Legend label <input id="ed_label" type="text" placeholder="legend text" /></label>
+      <label>Sweep label <input id="ed_sweeplabel" type="text"
+        placeholder="per line, e.g. T = {v} K  ({v}=value, {n}=index)" /></label>
+      <div class="sub-h">Sliders (slice the other dims)</div>
+      <div id="sliders" class="sliders"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Markers</h2>
+      <div class="row">
+        <button id="btnMarker" class="ghost">📍 Marker mode</button>
+        <button id="btnMarkerClear" class="ghost">Clear</button>
+      </div>
+      <p class="hint">left-click a point to add · right-click a marker to delete · they follow the sliders</p>
     </section>
   </aside>
 </div>
