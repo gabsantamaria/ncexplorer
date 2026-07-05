@@ -24,7 +24,8 @@ browser. Nothing is sent anywhere.
   waterfall**. The **colorbar** can be captioned and mapped to the variable of
   your choice — the sweep coordinate, the index, or *any parallel array sharing
   the sweep dimension* (just like the X axis), so a family of traces is colored
-  by the real parameter value instead of a bare index.
+  by the real parameter value instead of a bare index — with **SI unit scaling**
+  (MHz/GHz/…) on the colorbar too.
 - **Tabs — many plots, one project**: each tab is its own independently-formatted
   plot (its own traces, cosmetics, markers, sliders), while the **datasets on the
   left are shared** across all tabs. Add (`＋`), rename (double-click), close, and

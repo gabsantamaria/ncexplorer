@@ -19,7 +19,7 @@ export const PROJECT_FORMAT_V2 = "nc_explorer_project_v2";   // multi-tab, optio
 export const DEFAULT_PLOTCFG = {
   mode: "2D lines", title: "", xlabel: "", ylabel: "", zlabel: "",
   legend: true, legend_loc: "best", grid: true, logx: false, logy: false,
-  cmap: "Viridis", clabel: "", xunit: "", yunit: "",   // clabel = colorbar caption ("" = auto)
+  cmap: "Viridis", clabel: "", cunit: "", xunit: "", yunit: "",  // clabel = colorbar caption; cunit = colorbar SI prefix
   ylabel2: "", yunit2: "", logy2: false,      // secondary (right) y axis
   xmin: "", xmax: "", ymin: "", ymax: "",     // axis limits ("" = auto), in displayed units
   ymin2: "", ymax2: "",                       // right y axis limits

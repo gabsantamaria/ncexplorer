@@ -714,12 +714,19 @@ function redraw() {
   // shared colorbar: in Rainbow mode, or whenever a single-sweep family is
   // colored in 2D but had its legend omitted (>12 lines) so colors stay mappable
   if ((c.mode === "Rainbow" || (!is3d && coloredNoLegend)) && sharedName) {
-    const [lo, hi] = ranges[sharedName];
-    // caption: explicit override, else the chosen sweep source's label taken
-    // from the first trace driving this shared colorbar
+    // the trace driving this shared colorbar (first one with this sweep)
     const rep = fetched.find((f) => f.sweep === sharedName);
-    const clab = (c.clabel && c.clabel.trim())
-      || (rep ? X.sweepSourceLabel(state.dsets.get(rep.t.file), rep.t, sharedName) : sharedName);
+    // an index source is dimensionless — never SI-scale it or fold a prefix into
+    // its caption. Otherwise scale the DISPLAYED range (line colors stay
+    // ratio-normalized on the raw values, so they keep matching the bar).
+    const isIndex = rep && (rep.t.ssrc || "coord") === "index";
+    const cf = isIndex ? 1 : (X.PREFIX_FACTOR[c.cunit] || 1);
+    if (isIndex && c.cunit) notes.push("colorbar source is an index — SI scaling not applied");
+    const lo = ranges[sharedName][0] / cf, hi = ranges[sharedName][1] / cf;
+    // caption: explicit override (verbatim), else the source label (with the SI
+    // prefix folded in, except for the dimensionless index)
+    const srcLabel = rep ? X.sweepSourceLabel(state.dsets.get(rep.t.file), rep.t, sharedName) : sharedName;
+    const clab = (c.clabel && c.clabel.trim()) || (isIndex ? srcLabel : X.scaledLabel(srcLabel, c.cunit));
     data.push({
       type: "scatter", x: [firstX ? firstX[0] : 0], y: [null], mode: "markers",
       marker: { size: 0.1, color: [lo], colorscale: cmapScale(c.cmap), cmin: lo, cmax: hi > lo ? hi : lo + 1,
@@ -904,6 +911,7 @@ function cfgChanged() {
   c.legend = $("cfg_legend").checked; c.legend_loc = $("cfg_legloc").value;
   c.grid = $("cfg_grid").checked; c.logx = $("cfg_logx").checked; c.logy = $("cfg_logy").checked;
   c.cmap = $("cfg_cmap").value;
+  c.cunit = $("cfg_cscale").value === "—" ? "" : $("cfg_cscale").value;
   c.xunit = $("cfg_xscale").value === "—" ? "" : $("cfg_xscale").value;
   c.yunit = $("cfg_yscale").value === "—" ? "" : $("cfg_yscale").value;
   c.ylabel2 = $("cfg_ylab2").value;
@@ -927,6 +935,7 @@ function applyCfgWidgets() {
   $("cfg_legend").checked = c.legend; $("cfg_legloc").value = c.legend_loc;
   $("cfg_grid").checked = c.grid; $("cfg_logx").checked = c.logx; $("cfg_logy").checked = c.logy;
   $("cfg_cmap").value = c.cmap;
+  $("cfg_cscale").value = c.cunit || "—";
   $("cfg_xscale").value = c.xunit || "—"; $("cfg_yscale").value = c.yunit || "—";
   $("cfg_ylab2").value = c.ylabel2 || ""; $("cfg_yscale2").value = c.yunit2 || "—";
   $("cfg_logy2").checked = !!c.logy2;
@@ -976,27 +985,32 @@ function exportCSV() {
   const c = state.plotcfg;
   const xf = X.PREFIX_FACTOR[c.xunit] || 1;
   const yfL = X.PREFIX_FACTOR[c.yunit] || 1, yfR = X.PREFIX_FACTOR[c.yunit2] || 1;
+  const cf = X.PREFIX_FACTOR[c.cunit] || 1;    // sweep-value (colorbar) scale
   const rows = [];
+  let sweepScaled = false;
   for (const t of state.traces) {
     if (t.visible === false) continue;
     const ds = state.dsets.get(t.file);
     if (!ds) continue;
     const yf = t.yaxis === "right" ? yfR : yfL;   // each trace's own axis scale
+    const tcf = (t.ssrc || "coord") === "index" ? 1 : cf;   // index is dimensionless — never scale
     const axcol = t.yaxis === "right" ? "right" : "left";
     const { lines } = X.traceLines(ds, t, status);
     for (const ln of lines) {
       const m = Math.min(ln.x.length, ln.y.length);
       const lab = csvField(t.label || t.var);
-      const sv = ln.sval == null ? "" : X.fmt6(ln.sval);
+      const sv = ln.sval == null ? "" : X.fmt6(ln.sval / tcf);   // scaled, as displayed
+      if (ln.sval != null && tcf !== 1) sweepScaled = true;
       for (let k = 0; k < m; k++)
         rows.push(`"${lab}",${sv},${ln.x[k] / xf},${ln.y[k] / yf},${axcol}`);
     }
   }
   if (!rows.length) { status("Nothing plotted — nothing to export."); return; }
   let head = "# NC Explorer export (long format)\n";
-  if (xf !== 1 || yfL !== 1 || yfR !== 1)
+  const scf = sweepScaled ? cf : 1;            // only claim a sweep scale if one was applied
+  if (xf !== 1 || yfL !== 1 || yfR !== 1 || scf !== 1)
     head += `# axis scale: x÷${xf} (${c.xunit || "1"}), y-left÷${yfL} (${c.yunit || "1"}), `
-      + `y-right÷${yfR} (${c.yunit2 || "1"}) — as displayed\n`;
+      + `y-right÷${yfR} (${c.yunit2 || "1"}), sweep÷${scf} (${scf !== 1 ? c.cunit : "1"}) — as displayed\n`;
   head += "trace,sweep,x,y,yaxis\n";
   triggerDownload(new Blob([head + rows.join("\n") + "\n"], { type: "text/csv" }), "ncplot_" + stamp() + ".csv");
   status(`Exported ${rows.length} rows.`);
@@ -1248,6 +1262,7 @@ function init() {
   addOpts($("cfg_mode"), ["2D lines", "Rainbow", "3D waterfall"], "2D lines");
   addOpts($("cfg_legloc"), X.LEGEND_LOCS, "best");
   addOpts($("cfg_cmap"), CMAP_NAMES, "Viridis");
+  addOpts($("cfg_cscale"), X.UNIT_PREFIXES, "—");
   addOpts($("cfg_xscale"), X.UNIT_PREFIXES, "—");
   addOpts($("cfg_yscale"), X.UNIT_PREFIXES, "—");
   addOpts($("cfg_yscale2"), X.UNIT_PREFIXES, "—");
@@ -1269,7 +1284,7 @@ function init() {
   $("ed_color").oninput = () => editorChanged("color");
   $("ed_autocolor").onchange = () => editorChanged("autocolor");
   ["cfg_mode", "cfg_title", "cfg_xlab", "cfg_ylab", "cfg_zlab", "cfg_clabel", "cfg_legloc",
-    "cfg_cmap", "cfg_xscale", "cfg_yscale", "cfg_ylab2", "cfg_yscale2",
+    "cfg_cmap", "cfg_cscale", "cfg_xscale", "cfg_yscale", "cfg_ylab2", "cfg_yscale2",
     "cfg_xmin", "cfg_xmax", "cfg_ymin", "cfg_ymax", "cfg_ymin2", "cfg_ymax2",
     "cfg_figw", "cfg_figh"].forEach((id) => {
     $(id).onchange = cfgChanged;
