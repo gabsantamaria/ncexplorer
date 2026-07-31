@@ -864,6 +864,11 @@ function legendLoc(loc) {
     "upper left": { x: 0, y: 1, xanchor: "left", yanchor: "top" },
     "lower right": { x: 1, y: 0, xanchor: "right", yanchor: "bottom" },
     "lower left": { x: 0, y: 0, xanchor: "left", yanchor: "bottom" },
+    "upper center": { x: 0.5, y: 1, xanchor: "center", yanchor: "top" },
+    "lower center": { x: 0.5, y: 0, xanchor: "center", yanchor: "bottom" },
+    "center left": { x: 0, y: 0.5, xanchor: "left", yanchor: "middle" },
+    "center right": { x: 1, y: 0.5, xanchor: "right", yanchor: "middle" },
+    "center": { x: 0.5, y: 0.5, xanchor: "center", yanchor: "middle" },
   };
   return { ...(m[loc] || m.best), bgcolor: "rgba(255,255,255,0.7)", font: { size: 11 } };
 }

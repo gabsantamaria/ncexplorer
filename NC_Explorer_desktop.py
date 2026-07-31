@@ -56,7 +56,8 @@ except ImportError:
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers 3d projection)
 
 CMAPS = ["viridis", "plasma", "inferno", "turbo", "coolwarm", "rainbow"]
-LEGEND_LOCS = ["best", "upper right", "upper left", "lower right", "lower left"]
+LEGEND_LOCS = ["best", "upper right", "upper left", "lower right", "lower left",
+               "upper center", "lower center", "center left", "center right", "center"]
 MAX_SWEEP_LINES = 200          # cap runaway sweep families; noted in the status bar
 PROJECT_FORMAT = "nc_explorer_project_v1"
 DEFAULT_PLOTCFG = {"mode": "2D lines", "title": "", "xlabel": "",
