@@ -66,13 +66,30 @@ export function suggestTraces(ds, path) {
   return out;
 }
 
+// a trace's persisted fields, in the canonical (serialization) order
+export const TRACE_KEYS = ["file", "var", "line_dim", "sweep", "slices", "xsrc", "label", "sweep_label",
+  "ssrc", "yaxis", "visible", "color", "draw", "lw", "dash"];
+export const DRAW_MODES = ["lines", "markers", "lines+markers"];
+export const DASHES = ["auto", "solid", "dash", "dot", "dashdot"];
+export const LW_DEFAULT = 1.5;
+
 export function makeTrace(file, varName, lineDim, xsrc, sweep, slices, label, ssrc) {
   return {
-    file, var: varName, line_dim: lineDim, xsrc, sweep: sweep || "",
-    slices: { ...(slices || {}) }, label: label || varName,
-    sweep_label: "", yaxis: "left", visible: true, color: "",
+    file, var: varName, line_dim: lineDim, sweep: sweep || "",
+    slices: { ...(slices || {}) }, xsrc, label: label || varName,
+    sweep_label: "",
     ssrc: ssrc || "coord",   // colorbar (sweep-value) source: coord | index | var:<name>
+    yaxis: "left", visible: true, color: "",
+    draw: "lines",           // lines | markers | lines+markers
+    lw: LW_DEFAULT,          // line width (px)
+    dash: "auto",            // auto (solid left / dotted right) | solid | dash | dot | dashdot
   };
+}
+
+// trimmed units attribute of a variable ("" if none). Some files carry
+// trailing whitespace/newlines in units (e.g. "DBM\n").
+export function unitsOf(v) {
+  return String((v && v.attrs && v.attrs.units) || "").trim();
 }
 
 // natural default for a fresh trace off a variable
@@ -194,13 +211,13 @@ export function sweepSourceLabel(ds, t, sweep) {
     const name = src.slice(4);
     const sa = ds && ds.vars && ds.vars[name];
     if (sa && sa.dims.includes(s)) {
-      const u = sa.attrs && sa.attrs.units;
+      const u = unitsOf(sa);
       return u ? `${name} (${u})` : name;
     }
   }
   if (src === "index") return `${s} (index)`;
   const cv = ds && ds.vars && ds.vars[s];
-  const u = cv && cv.attrs && cv.attrs.units;
+  const u = unitsOf(cv);
   return u ? `${s} (${u})` : s;
 }
 
@@ -220,23 +237,22 @@ export function lineLabel(t, sweep, sval, j) {
 export function autoLabels(dsets, traces) {
   let xl = "", ylLeft = "", ylRight = "";
   for (const t of traces) {
-    if (!t.visible) continue;
+    if (t.visible === false) continue;
     const ds = dsets && dsets.get && dsets.get(t.file);
     if (!ds || !ds.has(t.var)) continue;
     const v = ds.variable(t.var);
     let yl = t.var;
-    if (v.attrs.units) yl += ` (${v.attrs.units})`;
+    if (unitsOf(v)) yl += ` (${unitsOf(v)})`;
     if ((t.yaxis || "left") === "right") { if (!ylRight) ylRight = yl; }
     else if (!ylLeft) ylLeft = yl;
     if (!xl) {
       if (t.xsrc && t.xsrc.startsWith("var:")) {
         const name = t.xsrc.slice(4);
         xl = name;
-        if (ds.vars[name] && ds.vars[name].attrs.units) xl += ` (${ds.vars[name].attrs.units})`;
+        if (unitsOf(ds.vars[name])) xl += ` (${unitsOf(ds.vars[name])})`;
       } else if (t.xsrc === "coord") {
         xl = t.line_dim;
-        if (ds.vars[t.line_dim] && ds.vars[t.line_dim].attrs.units)
-          xl += ` (${ds.vars[t.line_dim].attrs.units})`;
+        if (unitsOf(ds.vars[t.line_dim])) xl += ` (${unitsOf(ds.vars[t.line_dim])})`;
       } else xl = `${t.line_dim} (index)`;
     }
   }

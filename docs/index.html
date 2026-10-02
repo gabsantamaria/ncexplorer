@@ -17,47 +17,58 @@
 </head>
 <body>
 <header>
-  <img src="favicon.svg" alt="" class="logo" width="26" height="26" />
-  <h1>NC&nbsp;Explorer</h1>
-  <span class="sub">NetCDF (.nc) plotter — NetCDF-3 &amp; NetCDF-4/HDF5, fully in your browser</span>
+  <div class="brand">
+    <img src="favicon.svg" alt="" class="logo" width="24" height="24" />
+    <h1>NC&nbsp;Explorer</h1>
+  </div>
+  <!-- primary actions; every one also has a keyboard shortcut (press ? for the list) -->
+  <nav id="toolbar" class="toolbar" aria-label="main actions">
+    <button id="btnOpen" class="tb" data-icon="open" title="Open one or more .nc files (Ctrl+O)">Open</button>
+    <div class="split">
+      <button id="btnSaveProj" class="tb" data-icon="save"
+        title="Save the project (.ncproj): every tab, trace, derived quantity and cosmetic (Ctrl+S)">Save</button>
+      <button id="btnSaveMenu" class="tb caret" title="More save options" aria-haspopup="menu">▾</button>
+    </div>
+    <button id="btnLoadProj" class="tb" data-icon="load" title="Load a saved project (.ncproj)">Load</button>
+    <span class="tb-sep"></span>
+    <button id="btnNewDerived" class="tb" data-icon="func"
+      title="Create a derived quantity: peak / noise floor / mean / … in a window, or a − b (e.g. SNR)">Derived…</button>
+    <button id="btnExportMenu" class="tb" data-icon="export" aria-haspopup="menu"
+      title="Export the active plot (PNG, SVG, vector PDF) or its data (CSV)">Export ▾</button>
+    <button id="btnReportMenu" class="tb" data-icon="report" aria-haspopup="menu"
+      title="Multi-page report of several tabs: a PDF now, or a Python script that regenerates it">Report ▾</button>
+    <span class="tb-sep"></span>
+    <button id="btnUndo" class="tb icon-only" data-icon="undo" title="Undo (Ctrl+Z)" aria-label="Undo"></button>
+    <button id="btnRedo" class="tb icon-only" data-icon="redo" title="Redo (Ctrl+Y / Ctrl+Shift+Z)" aria-label="Redo"></button>
+    <span class="tb-grow"></span>
+    <button id="btnNew" class="tb danger" data-icon="new"
+      title="Start over: close all files, tabs and derived quantities, and clear the browser autosave">New project</button>
+    <button id="btnHelp" class="tb icon-only" data-icon="help" title="Help and keyboard shortcuts (?)" aria-label="Help"></button>
+  </nav>
 </header>
 
 <div id="layout">
-  <!-- LEFT: datasets + info + export/project -->
+  <!-- LEFT: datasets (incl. derived quantities) + info -->
   <aside id="left">
-    <section class="panel">
-      <h2>Datasets</h2>
-      <div class="row">
-        <button id="btnOpen">Open .nc…</button>
-        <button id="btnAdd" class="ghost">Add trace ➜</button>
+    <section class="panel grow" id="dsPanel">
+      <div class="panel-head">
+        <h2>Datasets</h2>
+        <span class="head-note" id="dsCount"></span>
       </div>
-      <div id="tree" class="tree"></div>
-      <input type="file" id="fileInput" accept=".nc,.nc4,.cdf,.h5,.hdf5" multiple hidden />
+      <div class="row">
+        <button id="btnOpen2" title="Open one or more .nc files (Ctrl+O)">Open .nc…</button>
+        <button id="btnAdd" class="ghost" disabled
+          title="Plot the selected variable in the active tab (or double-click it)">Add trace ➜</button>
+      </div>
+      <input id="treeFilter" class="filter" type="search" placeholder="Filter variables…"
+        title="Show only variables whose name contains this text" autocomplete="off" />
+      <div id="tree" class="tree" role="tree"></div>
+      <p class="hint" id="treeHint">Click a variable to see its info · double-click to plot it ·
+        right-click for more (derive, add to a new tab).</p>
     </section>
     <section class="panel">
-      <h2>Info</h2>
-      <pre id="info" class="info"></pre>
-    </section>
-    <section class="panel">
-      <h2>Export / project</h2>
-      <div class="row wrap">
-        <button id="btnPNG">PNG</button>
-        <button id="btnSVG" class="ghost">SVG</button>
-        <button id="btnPDF" class="ghost">PDF</button>
-        <button id="btnCSV" class="ghost">CSV</button>
-      </div>
-      <label class="chk"><input id="chk_embed" type="checkbox" /> Embed .nc data in the project file (self-contained)</label>
-      <div class="row">
-        <button id="btnSaveProj">Save project</button>
-        <button id="btnLoadProj" class="ghost">Load project</button>
-      </div>
-      <div class="row">
-        <button id="btnNew" class="warn">New project (clear all)</button>
-      </div>
-      <p class="hint">Every tab is saved in the project. Tick “Embed” to bundle the .nc files
-        inside it (one shareable, self-contained file — larger). Your work is also auto-saved
-        in this browser; “New project” wipes that saved session.</p>
-      <input type="file" id="projInput" accept=".ncproj,.json" hidden />
+      <div class="panel-head"><h2>Info</h2></div>
+      <pre id="info" class="info"><span class="muted">Select a variable to see its dimensions and attributes.</span></pre>
     </section>
   </aside>
 
@@ -66,32 +77,38 @@
   <!-- CENTER: tabs + plot + appearance -->
   <main id="center">
     <div id="tabbar" class="tabbar" title="each tab is its own formatted plot; datasets on the left are shared"></div>
-    <div id="plotWrap"><div id="plot"></div></div>
+    <div id="banner" class="banner" hidden></div>
+    <div id="plotWrap">
+      <div id="plot"></div>
+      <div id="emptyState" class="empty" hidden></div>
+    </div>
 
     <!-- appearance controls for the ACTIVE plot (per tab); collapsible -->
     <section id="appearance" class="appbar">
       <div class="appbar-head">
         <button id="appToggle" class="appbar-toggle" title="show / hide the appearance controls">▾ Appearance</button>
         <span class="appbar-hint">how the active plot looks — saved per tab</span>
+        <span class="tb-grow"></span>
+        <button id="btnCfgReset" class="link" title="Reset this tab's appearance to the defaults (traces are kept)">reset</button>
       </div>
       <div class="appbar-body">
         <div class="app-group">
           <div class="app-title">View</div>
-          <label>Mode <select id="cfg_mode"></select></label>
-          <label>Colormap <select id="cfg_cmap"></select></label>
+          <label title="2D lines · Rainbow (a sweep colored by a colormap, with a colorbar) · 3D waterfall">Mode <select id="cfg_mode"></select></label>
+          <label title="colors used for sweep families and the colorbar">Colormap <select id="cfg_cmap"></select></label>
         </div>
         <div class="app-group">
           <div class="app-title">Labels</div>
           <label>Title <input id="cfg_title" type="text" placeholder="—" /></label>
-          <label>X label <input id="cfg_xlab" type="text" placeholder="auto" /></label>
-          <label>Y label <input id="cfg_ylab" type="text" placeholder="auto" /></label>
-          <label>Z label <input id="cfg_zlab" type="text" placeholder="auto (3D)" /></label>
+          <label title="blank = automatic (from the X source and its units)">X label <input id="cfg_xlab" type="text" placeholder="auto" /></label>
+          <label title="blank = automatic (from the first left-axis trace and its units)">Y label <input id="cfg_ylab" type="text" placeholder="auto" /></label>
+          <label title="depth axis label in the 3D waterfall">Z label <input id="cfg_zlab" type="text" placeholder="auto (3D)" /></label>
         </div>
         <div class="app-group">
           <div class="app-title">Legend &amp; axes</div>
           <div class="row wrap">
             <label class="chk"><input id="cfg_legend" type="checkbox" checked /> Legend</label>
-            <select id="cfg_legloc"></select>
+            <select id="cfg_legloc" title="legend position"></select>
           </div>
           <div class="row wrap">
             <label class="chk"><input id="cfg_grid" type="checkbox" checked /> Grid</label>
@@ -99,8 +116,8 @@
             <label class="chk"><input id="cfg_logy" type="checkbox" /> log Y</label>
           </div>
           <div class="row">
-            <label>X ÷ <select id="cfg_xscale"></select></label>
-            <label>Y ÷ <select id="cfg_yscale"></select></label>
+            <label title="display X in SI units (e.g. G → GHz); labels and CSV follow">X ÷ <select id="cfg_xscale"></select></label>
+            <label title="display left Y in SI units">Y ÷ <select id="cfg_yscale"></select></label>
           </div>
         </div>
         <div class="app-group">
@@ -117,7 +134,7 @@
         <div class="app-group">
           <div class="app-title">Colorbar (sweeps)</div>
           <label>Label <input id="cfg_clabel" type="text" placeholder="auto (sweep values)" /></label>
-          <label>÷ <select id="cfg_cscale"></select></label>
+          <label title="display the colorbar values in SI units">÷ <select id="cfg_cscale"></select></label>
         </div>
         <div class="app-group">
           <div class="app-title">Right Y axis</div>
@@ -133,7 +150,7 @@
         </div>
         <div class="app-group">
           <div class="app-title">Size (fixed export)</div>
-          <label class="chk"><input id="cfg_lock" type="checkbox" /> Lock plot size</label>
+          <label class="chk" title="fix the figure size so exported text has the same size on every screen"><input id="cfg_lock" type="checkbox" /> Lock plot size</label>
           <div class="row">
             <label>W <input id="cfg_figw" type="number" min="2" max="40" step="0.5" value="8" /> in</label>
             <label>H <input id="cfg_figh" type="number" min="2" max="40" step="0.5" value="5.2" /> in</label>
@@ -148,46 +165,75 @@
   <!-- RIGHT: traces + selected trace + markers -->
   <aside id="right">
     <section class="panel">
-      <h2>Traces</h2>
-      <div id="traceList" class="trace-list"></div>
+      <div class="panel-head">
+        <h2>Traces</h2>
+        <span class="head-note" id="traceCount"></span>
+      </div>
+      <div id="traceList" class="trace-list" title="drag rows to reorder · double-click to rename"></div>
       <div class="row">
-        <button id="btnRemove" class="ghost">Remove</button>
-        <button id="btnClear" class="warn">Clear all</button>
+        <button id="btnDupTrace" class="ghost" title="Duplicate the selected trace (Ctrl+D)">Duplicate</button>
+        <button id="btnRemove" class="ghost" title="Remove the selected trace (Delete)">Remove</button>
+        <button id="btnClear" class="ghost danger-text" title="Remove every trace from this tab">Clear all</button>
       </div>
     </section>
 
     <section class="panel" id="editor">
-      <h2>Selected trace</h2>
-      <label>Line along <select id="ed_ldim"></select></label>
-      <label>X values <select id="ed_xsrc"></select></label>
-      <label>Sweep dim <select id="ed_sweep"></select></label>
-      <label>Sweep values <select id="ed_ssrc"></select></label>
-      <label>Y axis <select id="ed_yaxis"></select></label>
-      <div class="row wrap">
-        <label class="chk"><input id="ed_autocolor" type="checkbox" checked /> Auto color</label>
-        <label>Color <input id="ed_color" type="color" value="#1565c0" /></label>
+      <div class="panel-head">
+        <h2>Selected trace</h2>
+        <span class="head-note" id="edWhat"></span>
       </div>
-      <p class="hint">Uncheck “Auto” to set this trace’s color. (The <b>Colormap</b>
-        colors <i>sweep</i> families, not single traces.)</p>
-      <label>Legend label <input id="ed_label" type="text" placeholder="legend text" /></label>
-      <label>Sweep label <input id="ed_sweeplabel" type="text"
-        placeholder="per line, e.g. T = {v} K  ({v}=value, {n}=index)" /></label>
-      <div class="sub-h">Sliders (slice the other dims)</div>
-      <div id="sliders" class="sliders"></div>
+      <div id="edBody">
+        <div class="sub-h">Data</div>
+        <label title="the dimension each line runs along">Line along <select id="ed_ldim"></select></label>
+        <label title="what goes on the X axis: the index, the dimension's coordinate, or any variable sharing the dimensions">X values <select id="ed_xsrc"></select></label>
+        <label title="draw one line per index of this dimension (a family of lines)">Sweep dim <select id="ed_sweep"></select></label>
+        <label id="row_ssrc" title="which values color the sweep lines and label the colorbar">Sweep values <select id="ed_ssrc"></select></label>
+        <div class="sub-h">Style</div>
+        <div class="row">
+          <label title="left or right Y axis (right-axis traces are dotted by default)">Y axis <select id="ed_yaxis"></select></label>
+          <label title="lines, markers, or both">Draw <select id="ed_draw"></select></label>
+        </div>
+        <div class="row">
+          <label title="line width (px)">Width <input id="ed_lw" type="number" min="0.25" max="10" step="0.25" /></label>
+          <label title="auto = solid on the left axis, dotted on the right axis">Dash <select id="ed_dash"></select></label>
+        </div>
+        <div class="row wrap">
+          <label class="chk" title="automatic color from the palette (by trace position)"><input id="ed_autocolor" type="checkbox" checked /> Auto color</label>
+          <label>Color <input id="ed_color" type="color" value="#1565c0" /></label>
+        </div>
+        <p class="hint">Sweep families are colored by the tab's <b>Colormap</b>, not by this color.</p>
+        <div class="sub-h">Labels</div>
+        <label>Legend label <input id="ed_label" type="text" placeholder="legend text" /></label>
+        <label id="row_sweeplabel">Sweep label <input id="ed_sweeplabel" type="text"
+          placeholder="per line, e.g. T = {v} K  ({v}=value, {n}=index)" /></label>
+        <div class="sub-h">Sliders <span class="muted">(slice the other dims)</span></div>
+        <div id="sliders" class="sliders"></div>
+      </div>
+      <div id="edEmpty" class="muted ed-empty">Select a trace in the list above to edit it.</div>
     </section>
 
     <section class="panel">
-      <h2>Markers</h2>
+      <div class="panel-head"><h2>Markers</h2><span class="head-note" id="markerCount"></span></div>
       <div class="row">
-        <button id="btnMarker" class="ghost">📍 Marker mode</button>
-        <button id="btnMarkerClear" class="ghost">Clear</button>
+        <button id="btnMarker" class="ghost" title="Toggle marker mode (M)">📍 Marker mode</button>
+        <button id="btnMarkerClear" class="ghost" title="Remove every marker from this tab">Clear</button>
       </div>
-      <p class="hint">left-click a point to add · right-click a marker to delete · they follow the sliders</p>
+      <p class="hint">In marker mode: left-click a point to add · right-click a marker to delete.
+        Markers follow the sliders.</p>
     </section>
   </aside>
 </div>
 
-<footer id="status">Loading…</footer>
+<footer>
+  <span id="status">Loading…</span>
+  <span id="saveState" class="save-state" title="your session is auto-saved in this browser"></span>
+</footer>
+
+<div id="toasts" class="toasts" aria-live="polite"></div>
+<div id="dropOverlay" class="drop-overlay" hidden><div>Drop <b>.nc</b> data and/or a <b>.ncproj</b> project to open</div></div>
+<input type="file" id="fileInput" accept=".nc,.nc4,.cdf,.h5,.hdf5" multiple hidden />
+<input type="file" id="projInput" accept=".ncproj,.json" hidden />
+<input type="file" id="recipeInput" accept=".json,.ncrecipe" hidden />
 <script type="module" src="js/app.js"></script>
 </body>
 </html>

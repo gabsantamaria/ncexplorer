@@ -17,7 +17,7 @@
 //   });
 // push it, and every client will unregister on its next load.
 
-const CACHE = "ncx-cache-v1";
+const CACHE = "ncx-cache-v2";   // bump to drop every old cached copy on activate
 
 self.addEventListener("install", () => self.skipWaiting());
 
@@ -46,11 +46,21 @@ self.addEventListener("fetch", (e) => {
       return cached || (await fetching) || new Response("", { status: 504 });
     })());
   } else {
-    // network-first (app shell): fresh when online, cache when offline
+    // network-first (app shell): fresh when online, cache when offline. The
+    // request REVALIDATES with the server (cache: "no-cache") so the browser's
+    // HTTP cache can never hand back a stale module next to a fresh index.html
+    // (a mixed old/new app breaks on startup after an update).
     e.respondWith((async () => {
       const cache = await caches.open(CACHE);
       try {
-        const res = await fetch(req);
+        const fresh = req.mode === "navigate"
+          ? new Request(req.url, { cache: "no-cache", credentials: req.credentials })
+          : new Request(req, { cache: "no-cache" });
+        let res = await fetch(fresh);
+        // a navigation may not be answered with a "redirected" response:
+        // re-wrap it (same body/status/headers) like Workbox's cleanRedirect
+        if (req.mode === "navigate" && res.redirected)
+          res = new Response(await res.blob(), { status: res.status, statusText: res.statusText, headers: res.headers });
         if (res && res.ok) cache.put(req, res.clone());
         return res;
       } catch (err) {

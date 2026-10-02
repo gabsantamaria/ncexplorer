@@ -94,7 +94,7 @@ export class Dataset {
   dimAxisCandidates(dim) {
     const out = [];
     for (const [n, v] of Object.entries(this.vars)) {
-      if (n === dim) continue;
+      if (n === dim || v.derived) continue;      // a derived quantity is never a "natural" axis
       if (v.dims.length === 1 && v.dims[0] === dim && (v.isNumeric() || isTimeLike(v)))
         out.push(n);
     }
