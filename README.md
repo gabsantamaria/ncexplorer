@@ -101,11 +101,15 @@ opens the builder:
   - **X values**: the index, the dimension's coordinate, or any variable sharing
     the dimensions (window membership is evaluated on *each spectrum's own* x
     values, so per-spectrum frequency arrays work).
-  - **Window**: the whole span, a **fixed** x range, or **relative** to a
-    coordinate/variable that shares the remaining dimensions — `k × center +
-    offset ± half width` (e.g. `stimulusFrequency ± 1 MHz`, or harmonic `k = 2`).
-    Drag across the preview spectrum to set it; drag the shaded band or its edges
-    to adjust it. Inputs accept SI suffixes (`5k`, `1.5M`).
+  - **Window**: the whole span, *from … to …*, or *center ± half width*, where
+    every bound is an **expression** evaluated for each spectrum — names stand
+    for that spectrum's value of a remaining dimension or of any variable that
+    depends only on them. E.g. center `stimulusFrequency` (or `2*stimulusFrequency`
+    for the 2nd harmonic, `stimulusFrequency + 5k`) with half width
+    `0.01*stimulusFrequency` (1 % of the stimulus) or `3*ResolutionBWs` (3 × the
+    RBW used for that spectrum). Click a name or function under the fields to
+    insert it. Drag across the preview spectrum to set the window; drag the shaded
+    band or its edges to adjust it (proportional widths stay proportional).
   - **Use points** inside the window, outside it, or outside it but within a
     wider span.
   - **Statistic**: peak (max), minimum, mean, median, std, sum, integral
@@ -115,9 +119,15 @@ opens the builder:
     (10^(x/10)) and converted back to dB — averaging in dB would bias Gaussian
     noise low by ≈ 2.5 dB. Max/min/argmax are unaffected. NaN samples are
     ignored; an empty window (or a NaN window center) gives NaN.
-- **Combine** `a ∘ b` (− + × ÷ max min), matching dimensions **by name** (so
-  `spectrum − its own peak` broadcasts), with b a variable or a number.
-- **Transform**: dB → linear, linear → dB, `a·x + b`, `|x|`.
+- **Formula**: any expression of the file's variables, computed element by
+  element with dimensions matched **by name** — e.g. `peak - floor` (SNR),
+  `floor - 10*log10(ResolutionBWs)` (noise in dBm/Hz), `spectrums - spectrums_peak`
+  (each spectrum relative to its own peak). Units follow automatically
+  (dBm − dBm → dB).
+- **Expression syntax**: `+ - * /`, `^` (power), parentheses; numbers with SI
+  suffixes (`5k`, `1.5M`, `10m`, `3u`) or exponents (`2e-3`); functions `abs sqrt
+  exp ln log10 floor ceil round db2lin lin2db pow min max`; `pi`; quote names
+  with spaces or other characters: `"my var"`.
 - **Presets**: *Peak in window*, *Noise floor outside*, and *Peak + floor + SNR*
   (creates the three chained quantities at once).
 
@@ -245,7 +255,10 @@ Node tests (Node 18+; HDF5 files open through the vendored h5wasm). Set
 the cross-checks against independent numpy implementations (skipped otherwise):
 
 ```bash
+node tests/expr.test.mjs        # expression language: parser, functions, units
 node tests/derive.test.mjs      # derived-quantity engine (+ numpy cross-check)
 node tests/project.test.mjs     # .ncproj round trips, real lab projects, hostile input
 node tests/pyexport.test.mjs    # generated Python report: runs it, checks the PDF + numbers
+node tests/expr_parity.test.mjs # JS vs Python: random expressions + real-data derived values
+node tests/compat.test.mjs      # projects saved by older versions compute the same numbers
 ```

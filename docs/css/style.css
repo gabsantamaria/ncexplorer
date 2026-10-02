@@ -302,6 +302,24 @@ kbd { display: inline-block; font-family: Consolas, monospace; font-size: 11px; 
 .legend-chips i { display: inline-block; width: 12px; height: 10px; border-radius: 2px; vertical-align: -1px; margin-right: 3px; }
 .companions { margin: 4px 0 0; }
 .companions label { margin: 2px 0; }
+/* expression boxes + the name picker */
+.builder-form label.expr-row { display: flex; align-items: center; gap: 6px; }
+.builder-form input.expr { font-family: Consolas, "Courier New", monospace; font-size: 12px; }
+.builder-form input.expr.target { border-color: #9db2ca; }
+.expr-val { flex: none; max-width: 90px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-family: Consolas, monospace; font-size: 10.5px; color: var(--muted); }
+.builder-form .note.expr-err { margin: 0 0 4px 100px; }
+.picker { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; margin: 6px 0 2px; max-height: 92px; overflow: auto; }
+.picker-t { font-size: 11px; color: var(--muted); margin-right: 2px; }
+.chip { flex: none; background: #f2f6fb; color: var(--ink2); border: 1px solid var(--line); border-radius: 11px;
+  padding: 1px 8px; font-size: 11px; font-weight: 500; font-family: Consolas, monospace; }
+.chip:hover { background: var(--blue-sel); color: var(--blue); border-color: #9db2ca; }
+.chip.dim { background: #e8f3ec; }
+.chip.fn { font-family: inherit; font-weight: 600; color: #6a35d6; background: #f4efff; }
+.chip.link { font-family: inherit; background: transparent; border-color: transparent; color: var(--blue); }
+.expr-help table.kv { border-collapse: collapse; font-size: 12px; width: 100%; }
+.expr-help table.kv td { border-top: 1px solid var(--line); padding: 3px 8px 3px 0; vertical-align: top; }
+.expr-help table.kv td:first-child { white-space: nowrap; }
 .status-line { font-size: 11.5px; padding: 4px 8px; border-radius: 5px; background: #f2f6fb; color: var(--ink2); }
 .status-line.bad { background: #fdecea; color: var(--red); }
 .status-line.good { background: #e8f3ec; color: var(--green); }
@@ -339,6 +357,7 @@ footer #status { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsi
   .tree { max-height: 40vh; }
   .builder { grid-template-columns: 300px minmax(0, 1fr); }
   .builder-form label > span.lt { width: 80px; }
+  .builder-form .note.expr-err { margin-left: 86px; }
 }
 /* the derived-quantity builder stacks (form above the previews) only when narrow */
 @media (max-width: 860px) {

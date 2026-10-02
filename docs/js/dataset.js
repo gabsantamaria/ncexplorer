@@ -33,6 +33,7 @@ export class Variable {
     this._numeric = v.numeric;          // reader-supplied flag (preferred)
     this.data = v.data;                 // flat numeric array, or string / string[]
     this._maskFill();
+    this._unpack();
   }
   // apply CF/netCDF _FillValue / missing_value: sentinels -> NaN so they gap
   // in the plot instead of being drawn as real data
@@ -50,6 +51,29 @@ export class Variable {
     const isFill = (x) => fills.some((fv) =>
       x === fv || (Math.abs(fv) > 1e30 && Math.abs(x - fv) <= Math.abs(fv) * 1e-5));
     for (let i = 0; i < src.length; i++) { const x = Number(src[i]); out[i] = isFill(x) ? NaN : x; }
+    this.data = out;
+  }
+  // CF packed data: x * scale_factor + add_offset (after the fill masking, in
+  // double precision), as xarray's mask_and_scale does in the report script
+  _unpack() {
+    if (this.isChar || typeof this.data === "string" || !this.data
+        || this.data.length === undefined || !this.isNumeric()) return;
+    const a = this.attrs || {};
+    const one = (x) => {                // number | [number] | typed array -> finite number | null
+      const v = x !== null && typeof x === "object" && typeof x.length === "number" ? x[0] : x;
+      const n = v == null || typeof v === "string" ? NaN : Number(v);
+      return Number.isFinite(n) ? n : null;
+    };
+    const sf = one(a.scale_factor), ao = one(a.add_offset);
+    if (sf === null && ao === null) return;
+    const src = this.data;
+    const out = new Float64Array(src.length);
+    for (let i = 0; i < src.length; i++) {
+      let x = Number(src[i]);
+      if (sf !== null) x *= sf;
+      if (ao !== null) x += ao;
+      out[i] = x;
+    }
     this.data = out;
   }
   get ndim() { return this.dims.length; }

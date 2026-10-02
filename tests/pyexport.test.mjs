@@ -6,15 +6,22 @@
 //   - --dump-lines matches X.traceLines (docs/js/explore.js) on the same data,
 //     for every visible trace (derived ones too when docs/js/derive.js is present)
 //   - --dump-derived matches an independent reference implementation written
-//     here from the spec, AND derive.js's registerDerived (rel 1e-9, NaN <-> NaN)
+//     here from the specs (incl. a small expression evaluator of its own), a
+//     hand-written numpy computation (tests/py/expr_reference.py) for the
+//     expression case, AND derive.js's registerDerived (rel 1e-9, NaN <-> NaN)
+//     when derive.js already implements SPEC_EXPR (expression windows)
 //   - the script's helpers (fmt6, colormaps, SI labels, legend labels, axis
 //     limits, time units) match the JavaScript, and CONFIG round-trips every
 //     string (quotes, backslashes, triple quotes, unicode)
+//   - the script's expression engine (parser, evaluator, units, legacy-window
+//     migration, JS-style number text) on hand-written expectations, and vs
+//     docs/js/expr.js when it exists
 //
 // Run:  NCX_PYTHON=/path/to/python node tests/pyexport.test.mjs
 // Python needs numpy, xarray, matplotlib, scipy, h5netcdf, pypdf. Without a
 // usable Python (or without a data file) the affected checks are SKIPPED.
 // NCX_KEEP=1 keeps the temp folder (scripts, PDFs, PNGs) for inspection.
+// NCX_NO_DERIVE=1 skips the derive.js cross-check; NCX_CASES=A,I runs only those cases.
 
 import fs from "node:fs";
 import os from "node:os";
@@ -26,11 +33,30 @@ import { REPO, DATA_DIR, PYTHON, loadDataset, dataFile, haveData, moduleUrl,
 const X = await import(moduleUrl("explore.js"));
 const CM = await import(moduleUrl("colormaps.js"));
 const P = await import(moduleUrl("pyexport.js"));
-let D = null;
-try {
-  D = await import(moduleUrl("derive.js"));
-  if (typeof D.registerDerived !== "function") D = null;
-} catch (e) { console.log("derive.js not usable: " + e.message); D = null; }
+const { Variable } = await import(moduleUrl("dataset.js"));
+// derive.js (the web app's engine) is a cross-check only once it implements
+// the expression windows (SPEC_EXPR E4); before that the derived traces are
+// compared on the script's own dumped values
+let D = null, E = null;
+if (!process.env.NCX_NO_DERIVE) {
+  try {
+    D = await import(moduleUrl("derive.js"));
+    const modes = Array.isArray(D.WINDOW_MODES) ? D.WINDOW_MODES.map((m) => m.id) : [];
+    if (typeof D.registerDerived !== "function" || !modes.includes("center") || typeof D.exprError !== "function") {
+      console.log("derive.js does not implement expression windows yet - derive.js cross-check skipped");
+      D = null;
+    }
+  } catch (e) { console.log("derive.js not usable: " + e.message); D = null; }
+}
+// defs as the app loads them from a project (sanitizeDef migrates legacy
+// windows; a refused def is dropped, so it counts as "not computed")
+const jsDefs = (defs) => (D && typeof D.sanitizeDef === "function" ? defs.map((d) => D.sanitizeDef(d)).filter(Boolean) : defs);
+if (fs.existsSync(path.join(REPO, "docs", "js", "expr.js"))) {
+  try {
+    E = await import(moduleUrl("expr.js"));
+    if (typeof E.parseExpr !== "function" || typeof E.evalExpr !== "function") E = null;
+  } catch (e) { console.log("expr.js not usable: " + e.message); E = null; }
+}
 let appBuildProject = null;
 try { appBuildProject = (await import(moduleUrl("project.js"))).buildProject; }
 catch (e) { console.log("project.js not usable (" + e.message + ") - using a local project builder"); }
@@ -89,10 +115,16 @@ function project(tabs, derived = []) {
   };
   return JSON.parse(JSON.stringify(p));
 }
-const W0 = { mode: "none", lo: null, hi: null, lo2: null, hi2: null, center: "", k: 1, offset: 0,
+// windows: the expression format (SPEC_EXPR E2) and the legacy one (projects
+// saved before expressions; buildReportScript must migrate them)
+const W0 = { mode: "none", lo: "", hi: "", lo2: "", hi2: "", center: "", halfwidth: "", halfwidth2: "" };
+const W0_LEGACY = { mode: "none", lo: null, hi: null, lo2: null, hi2: null, center: "", k: 1, offset: 0,
   halfwidth: null, halfwidth2: null };
 const R = (name, file, src, over, xsrc, win, region, stat, extra = {}) => ({ name, file, kind: "reduce",
   units: "", description: "", src, over, xsrc, window: { ...W0, ...win }, region, stat, db: "auto", ...extra });
+const RL = (name, file, src, over, xsrc, win, region, stat, extra = {}) => ({ name, file, kind: "reduce",
+  units: "", description: "", src, over, xsrc, window: { ...W0_LEGACY, ...win }, region, stat, db: "auto", ...extra });
+const FM = (name, file, expr, extra = {}) => ({ name, file, kind: "formula", units: "", description: "", expr, ...extra });
 const CB = (name, file, a, op, b, extra = {}) => ({ name, file, kind: "combine", units: "", description: "",
   a, op, b, ...extra });
 const TF = (name, file, src, fn, extra = {}) => ({ name, file, kind: "transform", units: "", description: "",
@@ -117,15 +149,96 @@ function jsAxisRange(umin, umax, dmin, dmax, isLog) {
 }
 
 // ============================================================ independent derived reference
-// Straight from the frozen spec section 1, with plain loops (no code shared with
-// derive.js or the Python script). Returns Map(name -> {dims, shape, data} | {err}).
+// A small expression evaluator of its own (SPEC_EXPR E1; shares no code with
+// docs/js/expr.js or the Python script): text -> { names (first appearance),
+// fn(v) } where v(name) returns a name's value at the current element.
+// Throws on any syntax error.
+const MICRO = [u(0xb5), u(0x3bc)];
+const REF_SI = { p: 1e-12, n: 1e-9, u: 1e-6, m: 1e-3, k: 1e3, K: 1e3, M: 1e6, G: 1e9, T: 1e12,
+  [MICRO[0]]: 1e-6, [MICRO[1]]: 1e-6 };
+const cpow = (a, b) => (a === 1 || b === 0 || (a === -1 && Math.abs(b) === Infinity) ? 1 : Math.pow(a, b));
+const REF_FN = {
+  abs: [1, Math.abs], sqrt: [1, Math.sqrt], exp: [1, Math.exp], ln: [1, Math.log], log: [1, Math.log],
+  log10: [1, Math.log10], floor: [1, Math.floor], ceil: [1, Math.ceil], round: [1, (x) => Math.floor(x + 0.5)],
+  db2lin: [1, (x) => cpow(10, x / 10)], lin2db: [1, (x) => (x > 0 ? 10 * Math.log10(x) : NaN)],
+  pow: [2, cpow], min: [-1, (...a) => Math.min(...a)], max: [-1, (...a) => Math.max(...a)],
+};
+function refExpr(text) {
+  const toks = [];
+  const re = new RegExp("[ \\t\\r\\n]+|\"([^\"]+)\"|((?:\\d+\\.?\\d*|\\.\\d+)(?:[eE][+-]?\\d+)?)([pnumkKMGT"
+    + MICRO.join("") + "]?)(?![A-Za-z0-9_." + MICRO.join("") + "])|([A-Za-z_][A-Za-z0-9_]*)|(\\*\\*|[-+*/^(),])", "y");
+  while (re.lastIndex < text.length) {
+    const at = re.lastIndex, m = re.exec(text);
+    if (!m) throw new Error(`ref: cannot read '${text}' at ${at}`);
+    if (m[1] !== undefined) toks.push({ k: "name", v: m[1], quoted: true });
+    else if (m[2] !== undefined) toks.push({ k: "num", v: m[3] ? parseFloat(m[2]) * REF_SI[m[3]] : parseFloat(m[2]) });
+    else if (m[4] !== undefined) toks.push({ k: "name", v: m[4] });
+    else if (m[5] !== undefined) toks.push({ k: "op", v: m[5] === "**" ? "^" : m[5] });
+  }
+  if (!toks.length) throw new Error("ref: empty expression");
+  let p = 0;
+  const names = [];
+  const isOp = (v) => p < toks.length && toks[p].k === "op" && toks[p].v === v;
+  const need = (v) => { if (!isOp(v)) throw new Error(`ref: '${v}' expected in '${text}'`); p++; };
+  const binary = (sub, ops) => {
+    let a = sub();
+    while (ops.some(isOp)) {
+      const o = toks[p++].v, l = a, r = sub();
+      a = o === "+" ? (v) => l(v) + r(v) : o === "-" ? (v) => l(v) - r(v) : o === "*" ? (v) => l(v) * r(v) : (v) => l(v) / r(v);
+    }
+    return a;
+  };
+  const expr = () => binary(term, ["+", "-"]);
+  const term = () => binary(unary, ["*", "/"]);
+  const unary = () => {
+    if (isOp("-")) { p++; const a = unary(); return (v) => -a(v); }
+    if (isOp("+")) { p++; return unary(); }
+    return power();
+  };
+  const power = () => {
+    const a = atom();
+    if (!isOp("^")) return a;
+    p++;
+    const b = unary();
+    return (v) => cpow(a(v), b(v));
+  };
+  const atom = () => {
+    const t = toks[p++];
+    if (!t) throw new Error(`ref: unexpected end of '${text}'`);
+    if (t.k === "num") return () => t.v;
+    if (t.k === "name" && !t.quoted && isOp("(")) {
+      p++;
+      const args = [];
+      if (!isOp(")")) { args.push(expr()); while (isOp(",")) { p++; args.push(expr()); } }
+      need(")");
+      const f = REF_FN[t.v];
+      if (!f || (f[0] > 0 ? args.length !== f[0] : args.length < 1)) throw new Error(`ref: bad call ${t.v}`);
+      return (v) => f[1](...args.map((g) => g(v)));
+    }
+    if (t.k === "name") { if (!names.includes(t.v)) names.push(t.v); return (v) => v(t.v); }
+    if (t.k === "op" && t.v === "(") { const e = expr(); need(")"); return e; }
+    throw new Error(`ref: unexpected '${t.v}' in '${text}'`);
+  };
+  const fn = expr();
+  if (p < toks.length) throw new Error(`ref: trailing text in '${text}'`);
+  return { names, fn };
+}
+// names an expression text references (for the dependency order); [] if unreadable
+const refNames = (text) => { try { return refExpr(text).names; } catch (e) { return []; } };
+
+// Straight from the frozen specs (SPEC.md section 1 + SPEC_EXPR), with plain
+// loops (no code shared with derive.js or the Python script). Windows in the
+// legacy format ("fixed" / "relative") are computed with the OLD semantics, so
+// a legacy def the script migrates must give the same numbers.
+// Returns Map(name -> {dims, shape, data, units} | {err}); units null = not
+// worked out here (formulas: the cases list their expected units instead).
 function refDerived(ds, defs) {
   const out = new Map();
   const names = new Set(defs.map((d) => d.name));
   const scaleOf = (units) => X.asFloatArray([1], units)[0];
   const getVar = (n) => {
     if (names.has(n)) { const r = out.get(n); return r && !r.err ? r : null; }
-    const v = ds.vars[n];
+    const v = Object.prototype.hasOwnProperty.call(ds.vars, n) ? ds.vars[n] : null;
     if (!v || v.derived || !v.isNumeric()) return null;
     return { dims: v.dims, shape: v.shape, data: v.data, units: X.unitsOf(v) };
   };
@@ -139,12 +252,41 @@ function refDerived(ds, defs) {
       for (let a = dims.length - 1; a >= 0; a--) { if (++I[a] < shape[a]) break; I[a] = 0; }
     }
   };
+  // what a name in an expression is: its dims + its value at a multi-index
+  const refName = (n) => {
+    const v = getVar(n);
+    if (v) return { dims: v.dims, at: (idx) => Number(v.data[flat(v, idx)]) * scaleOf(v.units) };
+    if (Object.prototype.hasOwnProperty.call(ds.dims, n)) return { dims: [n], at: (idx) => idx[n] };
+    if (names.has(n)) throw new Error(`'${n}' could not be computed`);
+    if (ds.vars[n]) throw new Error(`'${n}' is not numeric`);
+    if (n === "pi") return { dims: [], at: () => Math.PI };
+    throw new Error(`unknown name '${n}'`);
+  };
+  // a compiled expression over the result dims (each name's dims must be among them)
+  const compile = (text, rdims) => {
+    if (typeof text !== "string" || !text.trim()) throw new Error("empty expression");
+    const { names: used, fn } = refExpr(text);
+    const res = new Map(used.map((n) => [n, refName(n)]));
+    for (const [n, r] of res) if (r.dims.some((x) => !rdims.includes(x))) throw new Error(`'${n}' has a dim the result lacks`);
+    return { used, res, at: (idx) => fn((n) => res.get(n).at(idx)) };
+  };
+  const legacy = (w) => w.mode === "fixed" || w.mode === "relative";
   const deps = (d) => {
     const r = [];
-    if (d.kind === "reduce") { r.push(d.src); if (d.xsrc.startsWith("var:")) r.push(d.xsrc.slice(4)); if (d.window.center.startsWith("var:")) r.push(d.window.center.slice(4)); }
-    else if (d.kind === "combine") { r.push(d.a); if (typeof d.b === "string") r.push(d.b); }
+    if (d.kind === "reduce") {
+      r.push(d.src);
+      if (d.xsrc.startsWith("var:")) r.push(d.xsrc.slice(4));
+      if (legacy(d.window)) { if (d.window.center.startsWith("var:")) r.push(d.window.center.slice(4)); }
+      else {
+        const ow = d.region === "outside_within";
+        const used = d.window.mode === "range" ? ["lo", "hi"].concat(ow ? ["lo2", "hi2"] : [])
+          : d.window.mode === "center" ? ["center", "halfwidth"].concat(ow ? ["halfwidth2"] : []) : [];
+        for (const k of used) r.push(...refNames(d.window[k]));
+      }
+    } else if (d.kind === "combine") { r.push(d.a); if (typeof d.b === "string") r.push(d.b); }
+    else if (d.kind === "formula") r.push(...refNames(d.expr));
     else r.push(d.src);
-    return r.filter((n) => names.has(n));
+    return r.filter((n) => names.has(n) && n !== d.name);
   };
   const stat = (xs, ys, lo, hi, lo2, hi2, region, st, db) => {
     const use = xs.map((x, k) => {
@@ -182,10 +324,8 @@ function refDerived(ds, defs) {
       if (!src || !src.dims.length || !src.dims.includes(d.over)) throw new Error("bad src/over");
       const STATS = ["max", "min", "mean", "median", "std", "sum", "integral", "count", "argmax_x", "argmin_x"];
       if (!STATS.includes(d.stat)) throw new Error("bad stat");
-      const w = d.window, n = ds.size(d.over);
+      const w = d.window, n = ds.size(d.over), ow = d.region === "outside_within";
       if (w.mode === "none" && d.region !== "inside") throw new Error("region needs window");
-      if (w.mode === "fixed" && (w.lo === null || w.hi === null)) throw new Error("fixed needs lo/hi");
-      if (w.mode === "relative" && w.halfwidth === null) throw new Error("relative needs halfwidth");
       const rdims = src.dims.filter((x) => x !== d.over), rshape = rdims.map((x) => ds.size(x));
       let xv = null, coord = null;
       if (d.xsrc.startsWith("var:")) {
@@ -195,21 +335,63 @@ function refDerived(ds, defs) {
         const cv = ds.vars[d.over];
         if (cv && cv.isNumeric()) coord = cv;
       }
-      let cvar = null, cdim = null, ccoord = null;
-      if (w.mode === "relative") {
+      // window -> bounds(idx) = [lo, hi, lo2, hi2] or null (undefined: no members)
+      let bounds;
+      if (w.mode === "none") bounds = () => [-Infinity, Infinity, -Infinity, Infinity];
+      else if (w.mode === "fixed") {          // legacy, old semantics
+        if (w.lo === null || w.hi === null) throw new Error("fixed needs lo/hi");
+        let lo2 = -Infinity, hi2 = Infinity;
+        if (w.lo2 !== null && w.hi2 !== null) { lo2 = Math.min(w.lo2, w.hi2); hi2 = Math.max(w.lo2, w.hi2); }
+        const b = [Math.min(w.lo, w.hi), Math.max(w.lo, w.hi), lo2, hi2];
+        bounds = () => b;
+      } else if (w.mode === "relative") {     // legacy, old semantics: k*c + offset +- |hw|
+        if (w.halfwidth === null) throw new Error("relative needs halfwidth");
+        let cAt;
         if (w.center.startsWith("coord:")) {
-          cdim = w.center.slice(6);
+          const cdim = w.center.slice(6);
           if (!rdims.includes(cdim)) throw new Error("bad center dim");
           const cv = ds.vars[cdim];
-          if (cv && cv.isNumeric()) ccoord = cv;
+          cAt = cv && cv.isNumeric() ? (idx) => Number(cv.data[idx[cdim]]) * scaleOf(X.unitsOf(cv)) : (idx) => idx[cdim];
         } else if (w.center.startsWith("var:")) {
-          cvar = getVar(w.center.slice(4));
+          const cvar = getVar(w.center.slice(4));
           if (!cvar || cvar.dims.some((x) => !rdims.includes(x))) throw new Error("bad center var");
+          cAt = (idx) => cvar.data[flat(cvar, idx)] * scaleOf(cvar.units);
         } else throw new Error("no center");
-      }
+        bounds = (idx) => {
+          const m = w.k * cAt(idx) + w.offset;
+          if (!Number.isFinite(m)) return null;
+          const h2 = w.halfwidth2 === null ? Infinity : Math.abs(w.halfwidth2);
+          return [m - Math.abs(w.halfwidth), m + Math.abs(w.halfwidth), m - h2, m + h2];
+        };
+      } else if (w.mode === "range") {
+        const lo = compile(w.lo, rdims), hi = compile(w.hi, rdims);
+        const lo2 = ow ? compile(w.lo2, rdims) : null, hi2 = ow ? compile(w.hi2, rdims) : null;
+        bounds = (idx) => {
+          const a = lo.at(idx), b = hi.at(idx);
+          const r = [Math.min(a, b), Math.max(a, b), -Infinity, Infinity];
+          if (ow) { const a2 = lo2.at(idx), b2 = hi2.at(idx); r[2] = Math.min(a2, b2); r[3] = Math.max(a2, b2); }
+          return r;
+        };
+      } else if (w.mode === "center") {
+        const c = compile(w.center, rdims), h = compile(w.halfwidth, rdims), h2 = ow ? compile(w.halfwidth2, rdims) : null;
+        bounds = (idx) => {
+          const m = c.at(idx), hw = Math.abs(h.at(idx));
+          const r = [m - hw, m + hw, -Infinity, Infinity];
+          if (ow) { const hw2 = Math.abs(h2.at(idx)); r[2] = m - hw2; r[3] = m + hw2; }
+          return r;
+        };
+      } else throw new Error("bad window mode");
       const db = d.db === "yes" || (d.db === "auto" && src.units.toLowerCase().includes("db"));
       const data = new Float64Array(rshape.reduce((a, b) => a * b, 1));
       each(rdims, rshape, (idx, f) => {
+        const b = bounds(idx);
+        // an undefined window (a needed bound not finite) has NO members
+        const defined = w.mode === "none" || (b && Number.isFinite(b[0]) && Number.isFinite(b[1])
+          && (!ow || (Number.isFinite(b[2]) && Number.isFinite(b[3]))));
+        if (!defined) {
+          data[f] = d.stat === "count" ? 0 : NaN;
+          return;
+        }
         const xs = [], ys = [];
         for (let k = 0; k < n; k++) {
           const j = { ...idx, [d.over]: k };
@@ -218,23 +400,18 @@ function refDerived(ds, defs) {
           else if (coord) xs.push(Number(coord.data[k]) * scaleOf(X.unitsOf(coord)));
           else xs.push(k);
         }
-        let lo = -Infinity, hi = Infinity, lo2 = -Infinity, hi2 = Infinity;
-        if (w.mode === "fixed") {
-          lo = Math.min(w.lo, w.hi); hi = Math.max(w.lo, w.hi);
-          if (w.lo2 !== null && w.hi2 !== null) { lo2 = Math.min(w.lo2, w.hi2); hi2 = Math.max(w.lo2, w.hi2); }
-        } else if (w.mode === "relative") {
-          let c;
-          if (cvar) c = cvar.data[flat(cvar, idx)] * scaleOf(cvar.units);
-          else c = ccoord ? Number(ccoord.data[idx[cdim]]) * scaleOf(X.unitsOf(ccoord)) : idx[cdim];
-          const m = w.k * c + w.offset;
-          // spec amendment: a relative window around a non-finite center has NO members
-          if (!Number.isFinite(m)) { data[f] = d.stat === "count" ? 0 : NaN; return; }
-          lo = m - Math.abs(w.halfwidth); hi = m + Math.abs(w.halfwidth);
-          if (w.halfwidth2 !== null) { lo2 = m - Math.abs(w.halfwidth2); hi2 = m + Math.abs(w.halfwidth2); }
-        }
-        data[f] = stat(xs, ys, lo, hi, lo2, hi2, d.region, d.stat, db);
+        data[f] = stat(xs, ys, b[0], b[1], b[2], b[3], d.region, d.stat, db);
       });
       return { dims: rdims, shape: rshape, data };
+    }
+    if (d.kind === "formula") {
+      const { names: used } = refExpr(d.expr);
+      const dims = [];
+      for (const nm of used) for (const x of refName(nm).dims) if (!dims.includes(x)) dims.push(x);
+      const c = compile(d.expr, dims), shape = dims.map((x) => ds.size(x));
+      const data = new Float64Array(shape.reduce((p, q) => p * q, 1));
+      each(dims, shape, (idx, f) => { data[f] = c.at(idx); });
+      return { dims, shape, data };
     }
     if (d.kind === "combine") {
       const a = getVar(d.a);
@@ -268,27 +445,32 @@ function refDerived(ds, defs) {
     });
     return { dims: s.dims.slice(), shape: s.shape.slice(), data };
   };
-  // AUTO units, spec section 1.5
+  // AUTO units, SPEC.md section 1.5 (null in -> null out: not worked out here)
   const DOT = u(0xb7), norm = (s) => String(s).trim().toLowerCase(), isDb = (s) => norm(s).includes("db");
   const unitsOf = (n) => { const v = typeof n === "string" ? getVar(n) : null; return v ? v.units : ""; };
   const autoUnits = (d) => {
+    if (d.kind === "formula") return null;
     if (d.kind === "reduce") {
       const su = unitsOf(d.src);
       const xu = d.xsrc === "coord" ? (ds.vars[d.over] ? X.unitsOf(ds.vars[d.over]) : "")
         : d.xsrc.startsWith("var:") ? unitsOf(d.xsrc.slice(4)) : "";
+      if (d.stat === "count") return "";
+      if (su === null || xu === null) return null;
       if (["max", "min", "mean", "median", "std", "sum"].includes(d.stat)) return su;
       if (d.stat === "integral") return su && xu ? su + DOT + xu : (su || xu);
-      if (d.stat === "count") return "";
       return xu;
     }
     if (d.kind === "combine") {
       const bVar = typeof d.b === "string", ua = unitsOf(d.a), ub = bVar ? unitsOf(d.b) : "";
+      if (ua === null || ub === null) return null;
       if (d.op === "-") return bVar && isDb(ua) && isDb(ub) && norm(ua) === norm(ub) ? "dB" : ua;
       if (d.op === "*") return ua && ub ? ua + DOT + ub : (ua || ub);
       if (d.op === "/") return ua && norm(ua) === norm(ub) ? "" : (ua && ub ? ua + "/" + ub : (ua || (ub ? "1/" + ub : "")));
       return ua;
     }
-    const su = unitsOf(d.src), n = norm(su);
+    const su = unitsOf(d.src);
+    if (su === null) return null;
+    const n = norm(su);
     if (d.fn === "db2lin") return n === "dbm" ? "mW" : n === "dbw" ? "W" : n === "db" ? "" : (su ? `lin(${su})` : "");
     if (d.fn === "lin2db") return n === "mw" ? "dBm" : n === "w" ? "dBW" : "dB";
     return su;
@@ -334,7 +516,7 @@ function jsChecks() {
 
   // neededDerived: transitive through src / a / b / xsrc var / center var; ssrc var; per file; per tab
   const defs = [
-    R("pk", "Darpa.NC", "spectrums", "TraceIndex", "var:fx", { mode: "relative", center: "var:ctr", halfwidth: 1 }, "inside", "max"),
+    RL("pk", "Darpa.NC", "spectrums", "TraceIndex", "var:fx", { mode: "relative", center: "var:ctr", halfwidth: 1 }, "inside", "max"),
     R("ctr", "darpa.nc", "spectrums", "TraceIndex", "index", {}, "inside", "argmax_x"),
     TF("fx", "darpa.nc", "frequencies", "scale"),
     CB("snr", "darpa.nc", "pk", "-", "fl"),
@@ -355,6 +537,74 @@ function jsChecks() {
   const nd = P.neededDerived({ tabs: ptabs, derived: defs }, [0]);
   check("neededDerived canonical key order", JSON.stringify(Object.keys(nd.find((d) => d.name === "pk")))
     === JSON.stringify(["name", "file", "kind", "units", "description", "src", "over", "xsrc", "window", "region", "stat", "db"]));
+  const WKEYS = ["mode", "lo", "hi", "lo2", "hi2", "center", "halfwidth", "halfwidth2"];
+  const pkw = nd.find((d) => d.name === "pk").window;
+  check("neededDerived migrates a legacy window", JSON.stringify(pkw)
+    === JSON.stringify({ mode: "center", lo: "", hi: "", lo2: "", hi2: "", center: "ctr", halfwidth: "1", halfwidth2: "" }), pkw);
+
+  // dependencies through EXPRESSIONS: the window fields in use + formula expr;
+  // numbers with an SI suffix, function names and unused fields are not references
+  const xdefs = [
+    R("w1", "e.nc", "s", "x", "index", { mode: "center", center: '"c f.1" + k', halfwidth: "3*hw(1)" }, "inside", "max"),
+    R("w2", "e.nc", "s", "x", "index", { mode: "range", lo: "5m + 2e3k", hi: "max(lo_def, 1)", lo2: "stale_ref", center: "m" }, "inside", "max"),
+    R("w3", "e.nc", "s", "x", "index", { mode: "center", center: "k", halfwidth: "1", halfwidth2: "ow_def", lo: "m" }, "outside_within", "max"),
+    FM("f1", "e.nc", "w1 - w2 + log10(  w1) + pi + w3"),
+    FM("c f.1", "e.nc", "2 * \"deep\""), FM("deep", "e.nc", "1"),
+    TF("k", "e.nc", "s", "abs"), TF("m", "e.nc", "s", "abs"), TF("hw", "e.nc", "s", "abs"),
+    TF("lo_def", "e.nc", "s", "abs"), TF("stale_ref", "e.nc", "s", "abs"), TF("log10", "e.nc", "s", "abs"),
+    TF("ow_def", "e.nc", "s", "abs"),
+    FM("unused", "e.nc", "k"),
+  ];
+  const xneed = P.neededDerived({ tabs: [{ name: "x", plot: {}, traces: [{ file: "e.nc", var: "f1" }], markers: [] }],
+    derived: xdefs }, [0]).map((d) => d.name).sort().join(",");
+  check("neededDerived follows expression names", xneed === "c f.1,deep,f1,k,lo_def,ow_def,w1,w2,w3", xneed);
+  check("exprRefs", JSON.stringify(P.exprRefs('3*RBW + "pk f" - max(a, 5m) + 2e3k*b2 - log10 ( c) + "pk f" + .5u'))
+    === JSON.stringify(["RBW", "pk f", "a", "b2", "c"]), P.exprRefs('3*RBW + "pk f" - max(a, 5m) + 2e3k*b2 - log10 ( c) + "pk f"'));
+  const fdef = P.neededDerived({ tabs: [{ name: "x", plot: {}, traces: [{ file: "e.nc", var: "f1" }], markers: [] }],
+    derived: [{ ...FM("f1", "e.nc", "x".repeat(1500)), extra: 1 }] }, [0])[0];
+  check("formula canonical keys + expr capped at 1000", JSON.stringify(Object.keys(fdef))
+    === JSON.stringify(["name", "file", "kind", "units", "description", "expr"]) && fdef.expr.length === 1000);
+
+  // legacy windows (SPEC_EXPR E3) and new-format clean-up
+  const MW = [
+    [{ mode: "relative", center: "coord:stimulusFrequency", k: 1, offset: 0, halfwidth: 1e6, halfwidth2: null },
+      { mode: "center", center: "stimulusFrequency", halfwidth: "1000000" }],
+    [{ mode: "relative", center: "var:peak f", k: 0.5, offset: -5e6, halfwidth: -0.02, halfwidth2: -1e-7 },
+      { mode: "center", center: '0.5*"peak f" - 5000000', halfwidth: "0.02", halfwidth2: "1e-7" }],
+    [{ mode: "relative", center: "var:max", k: -2, offset: 1e21, halfwidth: 3 },
+      { mode: "center", center: '-2*"max" + 1e+21', halfwidth: "3" }],
+    [{ mode: "relative", center: "var:pi", offset: 2.5, halfwidth: null }, { mode: "center", center: '"pi" + 2.5' }],
+    [{ mode: "relative", center: "", k: 3, halfwidth: 1 }, { mode: "center", halfwidth: "1" }],
+    [{ mode: "fixed", lo: 31e6, hi: 29e6, lo2: null, hi2: 4e7, center: "", k: 1, offset: 0, halfwidth: null, halfwidth2: null },
+      { mode: "range", lo: "31000000", hi: "29000000", hi2: "40000000" }],
+    [{ mode: "none", lo: 1, hi: 2, center: "coord:x", k: 1, offset: 0, halfwidth: 5 }, { mode: "none" }],
+    // a "range" / "center" window is never legacy (derive.js's rule): "var:f_c"
+    // stays as typed (an error in the app and in the script alike), unused
+    // fields are kept, numbers become their text, strings are capped at 320
+    [{ mode: "center", center: "var:f_c", halfwidth: "0.01*f_c" }, { mode: "center", center: "var:f_c", halfwidth: "0.01*f_c" }],
+    [{ mode: "range", lo: 5, hi: "x*2", lo2: true, hi2: null, center: "ignored", junk: 1 },
+      { mode: "range", lo: "5", hi: "x*2", center: "ignored" }],
+    [{ mode: "center", center: "a".repeat(400), halfwidth: 7 }, { mode: "center", center: "a".repeat(320), halfwidth: "7" }],
+    // a mode-none window with typed expressions is not taken for a legacy one
+    [{ mode: "none", center: "var:f", halfwidth: "0.01*f" }, { mode: "none", center: "var:f", halfwidth: "0.01*f" }],
+    [{ center: "coord:t" }, { mode: "none" }],
+    // legacy: only numbers count; a plain-text center is dropped; long names
+    // are not cut (311 characters at most)
+    [{ mode: "relative", center: "var:c", halfwidth: "20", halfwidth2: 5 }, { mode: "center", center: "c", halfwidth2: "5" }],
+    [{ mode: "relative", center: "c", halfwidth: 1 }, { mode: "center", halfwidth: "1" }],
+    [{ mode: "fixed", lo: "10", hi: 20 }, { mode: "range", hi: "20" }],
+    [{ mode: "relative", center: "var:L" + "x".repeat(255), k: -1.2345678901234567e-7, offset: 1.2345678901234567e-7, halfwidth: 1 },
+      { mode: "center", center: "-1.2345678901234566e-7*L" + "x".repeat(255) + " + 1.2345678901234566e-7", halfwidth: "1" }],
+    [{ mode: "relative", center: 'var:a"b', halfwidth: 1 }, { mode: "center", center: '"a"b"', halfwidth: "1" }],
+    [{ mode: "center", center: "f + 1", halfwidth: "2", lo: "kept" }, { mode: "center", lo: "kept", center: "f + 1", halfwidth: "2" }],
+    [{ mode: "bogus", lo: 1 }, { mode: "bogus" }],
+    [null, { mode: "none" }],
+    [{}, { mode: "none" }],
+  ];
+  const mbad = MW.map(([w, want]) => [w, P.migrateWindow(w), { ...W0, ...want }])
+    .filter(([, got, want]) => JSON.stringify(got) !== JSON.stringify(want) || JSON.stringify(Object.keys(got)) !== JSON.stringify(WKEYS));
+  check("migrateWindow (legacy -> expressions, key order)", mbad.length === 0, mbad);
+  MIGRATE_INPUTS.push(...MW.map(([w]) => w));
 
   // buildReportScript basics
   const proj = { format: "nc_explorer_project_v2", tabs: ptabs, derived: defs };
@@ -386,20 +636,22 @@ function buildCases() {
   // --- A. darpa: the motivating derived chain (+ every statistic)
   {
     const F = "darpa.nc";
-    const rel = { mode: "relative", center: "coord:stimulusFrequency", halfwidth: 1e6 };
+    const rel = { mode: "center", center: "stimulusFrequency", halfwidth: "1e6" };
     const derived = [
       R("peak", F, "spectrums", "TraceIndex", "var:frequencies", rel, "inside", "max"),
+      // "floor" is an expression function now: the app no longer lets you NAME
+      // a new quantity so, but an old project's "floor" must still compute
       R("floor", F, "spectrums", "TraceIndex", "var:frequencies", rel, "outside", "mean"),
       CB("SNR", F, "peak", "-", "floor"),
       R("peak_f", F, "spectrums", "TraceIndex", "var:frequencies", rel, "inside", "argmax_x"),
-      R("around_peak", F, "spectrums", "TraceIndex", "var:frequencies", { mode: "relative", center: "var:peak_f", halfwidth: 2e5 }, "inside", "mean"),
-      R("floor_med", F, "spectrums", "TraceIndex", "var:frequencies", { ...rel, halfwidth2: 5e6 }, "outside_within", "median"),
+      R("around_peak", F, "spectrums", "TraceIndex", "var:frequencies", { mode: "center", center: "peak_f", halfwidth: "2e5" }, "inside", "mean"),
+      R("floor_med", F, "spectrums", "TraceIndex", "var:frequencies", { ...rel, halfwidth2: "5e6" }, "outside_within", "median"),
       R("floor_std_lin", F, "spectrums", "TraceIndex", "var:frequencies", rel, "outside", "std", { db: "no" }),
       R("floor_std_db", F, "spectrums", "TraceIndex", "var:frequencies", rel, "outside", "std"),
-      R("band_int", F, "spectrums", "TraceIndex", "var:frequencies", { mode: "fixed", lo: 31e6, hi: 29e6 }, "inside", "integral"),
-      R("band_cnt", F, "spectrums", "TraceIndex", "var:frequencies", { mode: "fixed", lo: 29e6, hi: 31e6, lo2: 20e6, hi2: 40e6 }, "outside_within", "count"),
-      R("harm", F, "spectrums", "TraceIndex", "var:frequencies", { mode: "relative", center: "coord:stimulusFrequency", k: 0.5, offset: 5e6, halfwidth: 1e6 }, "inside", "max"),
-      R("argmin_out", F, "spectrums", "TraceIndex", "coord", { mode: "fixed", lo: 400, hi: 100 }, "outside", "argmin_x"),
+      RL("band_int", F, "spectrums", "TraceIndex", "var:frequencies", { mode: "fixed", lo: 31e6, hi: 29e6 }, "inside", "integral"),   // legacy
+      R("band_cnt", F, "spectrums", "TraceIndex", "var:frequencies", { mode: "range", lo: "29M", hi: "31M", lo2: "20e6", hi2: "40e6" }, "outside_within", "count"),
+      RL("harm", F, "spectrums", "TraceIndex", "var:frequencies", { mode: "relative", center: "coord:stimulusFrequency", k: 0.5, offset: 5e6, halfwidth: 1e6 }, "inside", "max"),   // legacy
+      R("argmin_out", F, "spectrums", "TraceIndex", "coord", { mode: "range", lo: "400", hi: "100" }, "outside", "argmin_x"),
       R("tot_sum", F, "spectrums", "TraceIndex", "index", {}, "inside", "sum", { db: "yes" }),
       R("min_all", F, "spectrums", "TraceIndex", "index", {}, "inside", "min"),
       R("peak_db_mean", F, "peak", "trace", "index", {}, "inside", "mean"),
@@ -414,7 +666,7 @@ function buildCases() {
       CB("cyc_b", F, "cyc_a", "+", 1),
       CB("dep_cyc", F, "cyc_a", "*", 2),
       R("bad_stat", F, "spectrums", "TraceIndex", "index", {}, "inside", "bogus"),
-      R("bad_fixed", F, "spectrums", "TraceIndex", "index", { mode: "fixed", lo: 1 }, "inside", "max"),
+      R("bad_fixed", F, "spectrums", "TraceIndex", "index", { mode: "range", lo: "1" }, "inside", "max"),   // hi empty
       TF("not_needed", F, "spectrums", "abs"),
       TF("case_mix", "C:\\lab\\DARPA.NC", "peak", "abs"),     // same file, other spelling + a path
     ];
@@ -444,8 +696,11 @@ function buildCases() {
     ];
     cases.push({ id: "A_darpa_derived", files: [F], project: project(tabs, derived), opts: {},
       pages: 5, derivedErrors: ["cyc_a", "cyc_b", "dep_cyc", "bad_stat", "bad_fixed"], notDumped: ["not_needed"],
-      expectOut: [/circular definition/, /unknown statistic/, /showing 200 evenly spaced/],
+      expectOut: [/circular definition/, /unknown statistic/, /showing 200 evenly spaced/, /window hi is empty/],
       units: { peak: "DBM", floor: "DBM", SNR: "dB", peak_mW: "mW", back_dBm: "dBm", ratio: "", abs_snr: "custom u", band_cnt: "" },
+      // legacy windows are migrated by buildReportScript (SPEC_EXPR E3)
+      configWindows: { harm: { mode: "center", center: "0.5*stimulusFrequency + 5000000", halfwidth: "1000000" },
+        band_int: { mode: "range", lo: "31000000", hi: "29000000" }, peak: { mode: "center", center: "stimulusFrequency", halfwidth: "1e6" } },
       png: true });
   }
 
@@ -453,13 +708,22 @@ function buildCases() {
   {
     const F = "sidebands.nc";
     const derived = [
-      R("pump_pk", F, "spectra_dbm", "wl", "var:wl_nm", { mode: "relative", center: "var:pump_nm", halfwidth: 0.05 }, "inside", "max"),
-      R("sb_floor", F, "spectra_dbm", "wl", "var:wl_nm", { mode: "relative", center: "var:pump_nm", halfwidth: 0.3, halfwidth2: 0.9 }, "outside_within", "median"),
-      R("pump_int", F, "spectra_dbm", "wl", "var:wl_nm", { mode: "relative", center: "var:pump_nm", halfwidth: 0.05 }, "inside", "integral"),
+      R("pump_pk", F, "spectra_dbm", "wl", "var:wl_nm", { mode: "center", center: "pump_nm", halfwidth: "0.05" }, "inside", "max"),
+      R("sb_floor", F, "spectra_dbm", "wl", "var:wl_nm", { mode: "center", center: "pump_nm", halfwidth: "0.3", halfwidth2: "0.9" }, "outside_within", "median"),
+      R("pump_int", F, "spectra_dbm", "wl", "var:wl_nm", { mode: "center", center: "pump_nm", halfwidth: "0.05" }, "inside", "integral"),
       // sb_low_nm has NaN entries: around a NaN center nothing is a member (NaN; count 0)
-      R("sb_low_out", F, "spectra_dbm", "wl", "var:wl_nm", { mode: "relative", center: "var:sb_low_nm", halfwidth: 0.02 }, "outside", "mean"),
-      R("sb_low_cnt", F, "spectra_dbm", "wl", "var:wl_nm", { mode: "relative", center: "var:sb_low_nm", halfwidth: 0.02 }, "outside", "count"),
+      R("sb_low_out", F, "spectra_dbm", "wl", "var:wl_nm", { mode: "center", center: "sb_low_nm", halfwidth: "0.02" }, "outside", "mean"),
+      R("sb_low_cnt", F, "spectra_dbm", "wl", "var:wl_nm", { mode: "center", center: "sb_low_nm", halfwidth: "0.02" }, "outside", "count"),
+      // windows over DIMENSION INDICES (freq / wl have no variables) and formula units
+      R("pk_idx", F, "spectra_dbm", "wl", "index", { mode: "center", center: "250 + 0*freq", halfwidth: "freq/10" }, "inside", "max"),
+      R("pk_idx_rng", F, "spectra_dbm", "wl", "index", { mode: "range", lo: "freq", hi: "freq + 100" }, "inside", "argmax_x"),
+      FM("wl_sq", F, "wl_nm^2"), FM("inv_f", F, "1/freq_Hz"), FM("f_over_f", F, "freq_Hz / freq_Hz"),
+      FM("pw_mul", F, "pump_dbm * freq_Hz"), FM("pw_neg", F, "wl_nm^-1"), FM("pw_half", F, "pow(wl_nm, 0.5)"),
+      FM("idx2d", F, "wl * 2 + freq"), FM("sb_add", F, "pump_dbm + 3"), FM("sb_db", F, "pump_dbm - sb_low_dbm"),
+      FM("sb_rt", F, "lin2db(db2lin(pump_dbm))"),
     ];
+    const FORMULA_UNITS = { wl_sq: "nm^2", inv_f: "1/Hz", f_over_f: "", pw_mul: "dBm" + u(0xb7) + "Hz", pw_neg: "nm^-1",
+      pw_half: "nm^0.5", idx2d: "", sb_add: "dBm", sb_db: "dB", sb_rt: "dBm", pk_idx: "dBm", pk_idx_rng: "" };
     const tabs = [
       tab("Rainbow spectra", { mode: "Rainbow", cmap: "Rainbow", cunit: "G", xunit: "k", xmin: "1.5502", xmax: "1.5508",
         ymin: "-75", title: "OSA spectra vs VNA frequency" }, [
@@ -474,13 +738,15 @@ function buildCases() {
         tr(F, "pump_int", "freq", "var:freq_Hz", "", {}, { yaxis: "right" }),
         tr(F, "sb_low_out", "freq", "var:freq_Hz", "", {}, { visible: false }),
         tr(F, "sb_low_cnt", "freq", "var:freq_Hz", "", {}, { visible: false }),
+        ...Object.keys(FORMULA_UNITS).map((v) => tr(F, v, "freq", "index", "", {}, { visible: false })),
       ]),
       tab("2D sweep, index colorbar", { cmap: "CoolWarm", cunit: "G" }, [
         tr(F, "spectra_dbm", "wl", "var:wl_nm", "freq", {}, { ssrc: "index" }),
       ]),
     ];
     cases.push({ id: "B_sidebands_rainbow", files: [F], project: project(tabs, derived),
-      opts: { pdfName: "sidebands_report", source: "sidebands" }, pages: 3, derivedErrors: [],
+      opts: { pdfName: "sidebands_report", source: "sidebands" }, pages: 3, derivedErrors: [], units: FORMULA_UNITS,
+      dimsOf: { idx2d: ["wl", "freq"], pk_idx: ["freq"], wl_sq: ["freq", "wl"] },
       expectOut: [/legend omitted/, /index - SI scaling not applied/],
       pdfText: [{ page: 0, includes: "OSA spectra vs VNA frequency" }, { page: 0, includes: "freq_Hz (GHz)" }],
       configPdfName: "sidebands_report.pdf", png: true, svg: true });
@@ -489,7 +755,7 @@ function buildCases() {
   // --- C. fourd: 3D waterfall
   {
     const F = "fourd.nc";
-    const derived = [R("fpk", F, "spectra", "traceindex", "var:frequency", { mode: "fixed", lo: 2e9, hi: 4e9 }, "inside", "max")];
+    const derived = [R("fpk", F, "spectra", "traceindex", "var:frequency", { mode: "range", lo: "2G", hi: "4e9" }, "inside", "max")];
     const tabs = [
       tab("3D waterfall", { mode: "3D waterfall", xunit: "G", zlabel: "d3 index", logx: true, xmin: "2",
         title: "4-D spectra" }, [
@@ -597,6 +863,104 @@ function buildCases() {
       besideScript: { [F]: "PowerCal_NC3.nc" }, defaultPaths: "powercal.pdf" });
   }
 
+  // --- I. darpa: EXPRESSION windows (the PI's case: f0 +- 1% of f0, f0 +- 3 RBW,
+  //        0.9 f0 .. 1.1 f0), formula chains, SI suffixes, quoted names,
+  //        functions, undefined windows, expression errors (the page that
+  //        plots one is skipped, exit code 0) and LEGACY defs written into
+  //        CONFIG by hand (the script migrates them; old semantics expected)
+  {
+    const F = "darpa.nc";
+    const S = (name, win, region, stat, extra) => R(name, F, "spectrums", "TraceIndex", "var:frequencies", win, region, stat, extra);
+    const cw = (center, halfwidth, halfwidth2 = "") => ({ mode: "center", center, halfwidth, halfwidth2 });
+    const nanHw = "0.01*stimulusFrequency + 0*sqrt(stimulusAmp - 0.01)";   // NaN where stimulusAmp < 0.01
+    const derived = [
+      S("pk_rel", cw("stimulusFrequency", "0.01*stimulusFrequency"), "inside", "max"),
+      S("fl_rbw", cw("stimulusFrequency", "3*ResolutionBWs"), "outside", "mean"),
+      S("pk_rng", { mode: "range", lo: "stimulusFrequency*0.9", hi: "stimulusFrequency*1.1" }, "inside", "max"),
+      S("pk_f", { mode: "range", lo: "stimulusFrequency * 1.1", hi: " stimulusFrequency*0.9 " }, "inside", "argmax_x"),
+      S("fl_ow", cw('"stimulusFrequency"', "3*ResolutionBWs", "0.25 * stimulusFrequency"), "outside_within", "median"),
+      S("cnt_si", { mode: "range", lo: "29.5M", hi: "30500k" }, "inside", "count"),
+      S("pk dBm", cw("2*stimulusFrequency - stimulusFrequency", "(1e6)"), "inside", "max"),
+      S("pk_nan", cw("stimulusFrequency", nanHw), "inside", "max"),
+      S("cnt_nan", cw("stimulusFrequency", nanHw), "inside", "count"),
+      S("fl_nanouter", cw("stimulusFrequency", "1M", "ln(stimulusAmp*100 - 1) * 10M"), "outside_within", "mean"),
+      S("pk_trace", cw("stimulusFrequency + trace*0", "250k"), "inside", "max"),
+      // fields the mode/region does not use are ignored (no false cycle, no error)
+      S("unused_f", { ...cw("stimulusFrequency", "1M", "unused_f + nonsense("), lo: "unused_f" }, "inside", "max"),
+      FM("snr", F, "pk_rel - fl_rbw"),
+      FM("density", F, "fl_rbw - 10*log10(ResolutionBWs)"),
+      FM("q_snr", F, '"pk dBm" - fl_rbw'),
+      FM("dimorder", F, "trace + ResolutionBWs"),
+      FM("fn_mix", F, "max(pk_rel, fl_rbw + 20) - min(pk_rel, -30)"),
+      FM("fn_all", F, "abs(fl_rbw) + sqrt(ResolutionBWs) + exp(-stimulusAmp) + ln(VideoBWs) + log(2) + log10(100)"
+        + " + floor(pk_rel) + ceil(fl_rbw) + round(pk_rel)"),
+      FM("lin", F, "db2lin(pk_rel)"), FM("back", F, "lin2db(lin)"), FM("ratio", F, "lin / lin"),
+      FM("pw", F, "pow(2, 10) + 2^3^2 - -2^2 + 2**-1"),
+      FM("si", F, "2e3k + 5m + 1" + u(0xb5) + " + 1" + u(0x3bc) + " + 3K + 4G + 2T + 7p + 9n + 3u + .5"),
+      FM("twopi", F, "2*pi"),
+      FM("chain2", F, "snr + 0*density"),
+      // mistakes: each is reported with its field / name / position
+      S("bad_hw", cw("stimulusFrequency", "3*RBWs"), "inside", "max"),
+      S("bad_dim", cw("frequencies", "1M"), "inside", "max"),
+      S("bad_empty", cw("stimulusFrequency", " "), "inside", "max"),
+      FM("bad_syntax", F, "pk_rel +"),
+      FM("bad_fn", F, "foo(pk_rel)"),
+      FM("bad_num", F, "5ms * pk_rel"),
+      FM("bad_dep", F, "bad_hw + 1"),
+      // an OLD def named like a function still computes (the app keeps it); in
+      // an expression max(...) is the function and a bare max the variable
+      FM("max", F, "1"), FM("uses_max", F, 'max + max(1, 2) + "max"'),
+    ];
+    // hand-edited CONFIG: legacy defs inserted at the FRONT (leg_var's migrated
+    // center "pk_f - 100000" must still order it after pk_f)
+    const legacyDefs = [
+      RL("leg_rel", F, "spectrums", "TraceIndex", "var:frequencies",
+        { mode: "relative", center: "coord:stimulusFrequency", k: 0.5, offset: 5e6, halfwidth: -1e6 }, "inside", "max"),
+      RL("leg_fix", F, "spectrums", "TraceIndex", "var:frequencies",
+        { mode: "fixed", lo: 31e6, hi: 29e6, lo2: 20e6, hi2: 40e6 }, "outside_within", "count"),
+      RL("leg_var", F, "spectrums", "TraceIndex", "var:frequencies",
+        { mode: "relative", center: "var:pk_f", k: 1, offset: -1e5, halfwidth: 2e5, halfwidth2: 1e6 }, "outside_within", "mean"),
+    ];
+    const vs = (v, extra = {}) => tr(F, v, "stimulusFrequency", "coord", "stimulusAmp", { trace: 0 }, extra);
+    const hidden = (v) => vs(v, { visible: false });
+    const tabs = [
+      tab("Expression windows", { title: "Peak within f0 ± 1 %, floor outside f0 ± 3 RBW", legend_loc: "center right",
+        ylabel: "Power (dBm)", ylabel2: "SNR (dB)" }, [
+        vs("pk_rel", { draw: "lines+markers" }), vs("fl_rbw", { draw: "lines+markers", dash: "dash" }),
+        vs("pk_rng", { label: "peak in 0.9 f0 .. 1.1 f0", dash: "dot" }), vs("snr", { yaxis: "right", lw: 2 }),
+      ]),
+      tab("Formulas", {}, [
+        vs("density"), vs("q_snr"),
+        tr(F, "dimorder", "trace", "index", "stimulusAmp", { stimulusFrequency: 1 }, { yaxis: "right" }),
+      ]),
+      tab("Broken", {}, [vs("pk_rel"), vs("bad_hw")]),
+      tab("Undefined windows", {}, [
+        vs("pk_nan"), vs("cnt_nan", { yaxis: "right" }),
+        ...["pk_f", "fl_ow", "cnt_si", "pk dBm", "fl_nanouter", "pk_trace", "fn_mix", "fn_all", "lin", "back", "ratio",
+          "pw", "si", "twopi", "chain2", "unused_f", "bad_dim", "bad_empty", "bad_syntax", "bad_fn", "bad_num", "bad_dep", "uses_max"].map(hidden),
+      ]),
+    ];
+    const si = 2e3 * 1e3 + 5 * 1e-3 + 1 * 1e-6 + 1 * 1e-6 + 3 * 1e3 + 4 * 1e9 + 2 * 1e12 + 7 * 1e-12 + 9 * 1e-9 + 3 * 1e-6 + 0.5;
+    cases.push({ id: "I_darpa_expressions", files: [F], project: project(tabs, derived), opts: {},
+      appendConfig: legacyDefs.map((d) => `CONFIG["derived"].insert(0, ${P.pyLiteral(d, 0, 30)})`).join("\n"),
+      pages: 3, skippedTabs: [2],
+      derivedErrors: ["bad_hw", "bad_dim", "bad_empty", "bad_syntax", "bad_fn", "bad_num", "bad_dep"],
+      expectOut: [/WARNING: page 3\/4 'Broken' skipped: it plots derived 'bad_hw' \(darpa\.nc\), which could not be computed/,
+        /derived 'bad_hw' \(darpa\.nc\) not computed: window halfwidth: unknown name 'RBWs' at position 2\r?\n {8}3\*RBWs\r?\n {10}\^/,
+        /derived 'bad_dim' .* window center: 'frequencies' has dimension 'TraceIndex', which the result lacks at position 0/,
+        /derived 'bad_empty' .* window halfwidth is empty/, /derived 'bad_fn' .* formula: unknown function 'foo' at position 0/,
+        /derived 'bad_num' .* formula: invalid number '5ms' at position 0/,
+        /derived 'bad_syntax' .* formula: unexpected end of the expression at position 8/,
+        /derived 'bad_dep' \(darpa\.nc\) not computed: uses 'bad_hw', which could not be computed/],
+      units: { pk_rel: "DBM", fl_rbw: "DBM", pk_f: "", cnt_si: "", snr: "dB", density: "DBM", q_snr: "dB", dimorder: "",
+        fn_mix: "dB", fn_all: "DBM", lin: "mW", back: "dBm", ratio: "", pw: "", si: "", twopi: "", chain2: "DBM", max: "", uses_max: "",
+        leg_rel: "DBM", leg_fix: "", leg_var: "DBM", unused_f: "DBM" },
+      dimsOf: { dimorder: ["trace", "stimulusFrequency", "stimulusAmp"], twopi: [], pk_rel: ["stimulusFrequency", "stimulusAmp", "trace"] },
+      expectValues: { pw: [1540.5], twopi: [2 * Math.PI], si: [si], ratio: Array(12).fill(1), max: [1], uses_max: [4],
+        cnt_si: [21, 21, 21, 21, 21, 21, 0, 0, 0, 0, 0, 0] },
+      numpyRef: "expr_reference.py", png: true });
+  }
+
   // --- G. a v1 / desktop project (absolute Windows paths), remapped through FILES
   if (fs.existsSync(dataFile("desktop.ncproj"))) {
     const proj = JSON.parse(fs.readFileSync(dataFile("desktop.ncproj"), "utf8"));
@@ -641,6 +1005,10 @@ async function runCase(cs) {
   for (const [name, target] of Object.entries(cs.remap || {})) {
     script = patchFiles(script, name, target);          // relative path in FILES
     filePath[name] = dataFile(target);
+  }
+  if (cs.appendConfig) {      // a hand edit of the CONFIG section
+    if (!script.includes("\nSCRIPT_DIR = ")) throw new Error("SCRIPT_DIR marker not found");
+    script = script.replace("\nSCRIPT_DIR = ", () => "\n" + cs.appendConfig + "\n\nSCRIPT_DIR = ");
   }
   const scriptPath = path.join(dir, "report.py");
   fs.writeFileSync(scriptPath, script, "utf8");
@@ -727,6 +1095,25 @@ async function runCase(cs) {
   // --- lines + derived
   const lines = JSON.parse(fs.readFileSync(lj, "utf8"));
   const der = JSON.parse(fs.readFileSync(dj, "utf8"));
+  for (const [name, want] of Object.entries(cs.configWindows || {})) {
+    const d = cfg.derived.find((x) => x.name === name), w = { ...W0, ...want };
+    check(`${tag}: CONFIG window of '${name}' (expression format)`, d && JSON.stringify(d.window) === JSON.stringify(w), d && d.window);
+  }
+  if (cs.numpyRef) {          // hand-written numpy computation of the same quantities
+    const nj = path.join(dir, "numpy_ref.json");
+    const nr = runPy([path.join(PY_DIR, cs.numpyRef), DATA_DIR, nj]);
+    if (check(`${tag}: numpy reference ran`, nr.status === 0, nr.out)) {
+      const ref = JSON.parse(fs.readFileSync(nj, "utf8")), got = der[cs.files[0]] || {};
+      for (const [name, e] of Object.entries(ref)) {
+        const pv = got[name];
+        if (!check(`${tag}: ${name} dumped (numpy ref)`, !!pv)) continue;
+        check(`${tag}: ${name} dims/shape vs numpy ref`, JSON.stringify([pv.dims, pv.shape]) === JSON.stringify([e.dims, e.shape]),
+          [pv.dims, pv.shape, e.dims, e.shape]);
+        check(`${tag}: ${name} values vs numpy ref (rel 1e-9)`, arrClose(pv.data, e.data, 1e-9), firstDiff(pv.data, e.data, 1e-9));
+      }
+      console.log(`  ${tag}: compared ${Object.keys(ref).length} quantities with the hand-written numpy reference`);
+    }
+  }
   await compareDerived(tag, cs, cfg, der, filePath);
   await compareLines(tag, cs, cfg, lines, der, filePath);
 }
@@ -758,12 +1145,18 @@ async function probeHelpers(tag, scriptPath, dir) {
     ["", "10", -3, 50, true], ["-1", "-0.5", 1, 2, true], ["1e-4", "", 1e-6, 2e-3, true], ["abc", "", 0, 1, false],
     [" 12x", "", 0, 100, false]];
   const tsu = ["", "ns", "nanoseconds since 2000", "s", "milliseconds", "ms", "Microseconds", "minutes",
-    "hours since 1970", "days since 2000-01-01", "dns", "x ns y", "seconds", "DBM"];
+    "hours since 1970", "days since 2000-01-01", "dns", "x ns y", "seconds", "DBM", " minutes", "ns\n", "\ufeffhours"];
   const req = {
     fmt6: fmtIn.map(enc), ts: tsIn.map(enc), cmaps: [...CM.CMAP_NAMES, "Nope"], scaled,
     line_label: llTraces.map(([t, sw, sv, j]) => [t, sw, sv === null ? null : enc(sv), j]),
     axis_range: ar.map(([a, b, c, d, e]) => [a, b, enc(c), enc(d), e]), time_scale: tsu,
   };
+  if (tag.startsWith("A")) {      // the expression engine, once
+    req.exprs = EXPR_CASES.map((c) => c[0]);
+    // (a > 320-char field is capped by the JS side only: a hand-typed one stays whole)
+    req.migrate = MIGRATE_INPUTS.filter((w) => !(w && typeof w.center === "string" && w.center.length > 320));
+    req.js_str = JS_STR_VALUES;
+  }
   const rq = path.join(dir, "probe_req.json"), ro = path.join(dir, "probe_out.json");
   fs.writeFileSync(rq, JSON.stringify(req));
   const r = runPy([path.join(PY_DIR, "probe_helpers.py"), scriptPath, rq, ro]);
@@ -792,8 +1185,142 @@ async function probeHelpers(tag, scriptPath, dir) {
     check("axis_range matches app.js axisRange", abad.length === 0, abad);
     const tbad = tsu.map((s, i) => [s, X.asFloatArray([1], s)[0], out.time_scale[i]]).filter((x) => x[1] !== x[2]);
     check("time_scale matches JS asFloatArray", tbad.length === 0, tbad);
+    checkExprProbe(out, req);
   }
   return out;
+}
+
+// ------------------------------------------------------------ expression engine (Python) checks
+// Formulas over the probe's fake file (tests/py/probe_helpers.py FakeFile):
+// a = 2 V, b = 3 V, c = NaN; v(d) = [1,2,3] dBm; w(e) = [10,20] dBm; t(d) =
+// [1,2,3] ns; dim e (2) has no variable; dim s (4) only a non-numeric
+// variable; str(d) is non-numeric.
+// [text, {v: values, dims, units, names}]  or  [text, {err: true, pos}]
+const DOT = u(0xb7);
+const EXPR_CASES = [
+  ["1+2*3", { v: [7], dims: [], units: "" }], ["(1+2)*3", { v: [9] }], ["2^3^2", { v: [512] }], ["2**3**2", { v: [512] }],
+  ["-2^2", { v: [-4] }], ["(-2)^2", { v: [4] }], ["2^-1", { v: [0.5] }], ["-a^2", { v: [-4], units: "V^2" }],
+  ["a^b", { v: [8], units: "" }], ["1 - 2 - 3", { v: [-4] }], ["8/4/2", { v: [1] }], ["+a", { v: [2], units: "V" }],
+  ["--a", { v: [2], units: "V" }], ["2*-a", { v: [-4], units: "V" }], ["-a^-1", { v: [-0.5], units: "V^-1" }],
+  ["10k", { v: [10 * 1e3] }], ["2.5M", { v: [2.5 * 1e6] }], ["1e3m", { v: [1e3 * 1e-3] }], ["2e3k", { v: [2e3 * 1e3] }],
+  [".5u", { v: [0.5 * 1e-6] }], ["3" + u(0xb5), { v: [3 * 1e-6] }], ["3" + u(0x3bc), { v: [3 * 1e-6] }], ["7p", { v: [7 * 1e-12] }],
+  ["4G", { v: [4 * 1e9] }], ["1T", { v: [1 * 1e12] }], ["2K", { v: [2 * 1e3] }], ["5n", { v: [5 * 1e-9] }], ["3.E2k", { v: [300 * 1e3] }],
+  ["0.1 + 0.2", { v: [0.1 + 0.2] }], ["pi", { v: [Math.PI], units: "", names: ["pi"] }], ["2*pi", { v: [2 * Math.PI] }],
+  ["abs(-3)", { v: [3] }], ["sqrt(16)", { v: [4] }], ["exp(0)", { v: [1] }], ["ln(1)", { v: [0] }], ["log(1)", { v: [0] }],
+  ["log10(1000)", { v: [Math.log10(1000)] }], ["floor(-2.5)", { v: [-3] }], ["ceil(-2.5)", { v: [-2] }],
+  ["round(2.5)", { v: [3] }], ["round(-2.5)", { v: [-2] }], ["round(-0.5)", { v: [0] }], ["db2lin(20)", { v: [100] }],
+  ["lin2db(100)", { v: [20] }], ["lin2db(0)", { v: [NaN] }], ["lin2db(-1)", { v: [NaN] }], ["pow(2, 10)", { v: [1024] }],
+  ["min(3, 1, 2)", { v: [1] }], ["max(3, 1, 2)", { v: [3] }], ["max(1)", { v: [1] }], ["max(1, c)", { v: [NaN] }],
+  ["min(c, 1)", { v: [NaN] }], ["pow(1, c)", { v: [1] }], ["c^0", { v: [1] }], ["1^c", { v: [1] }], ["(-1)^(1/0)", { v: [1] }],
+  ["(-1)^(-1/0)", { v: [1] }], ["2^c", { v: [NaN] }], ["(-8)^(1/3)", { v: [NaN] }], ["1/0", { v: [Infinity] }],
+  ["-1/0", { v: [-Infinity] }], ["0/0", { v: [NaN] }], ["sqrt(-1)", { v: [NaN] }], ["ln(0)", { v: [-Infinity] }],
+  ["c + 1", { v: [NaN] }], ["  a  *\tb\r\n", { v: [6], units: "V" + DOT + "V" }], ['"a" + "b"', { v: [5], units: "V", names: ["a", "b"] }],
+  ["log10 (100)", { v: [2] }],
+  // broadcasting by dimension NAME; dims in order of first appearance
+  ["v + e", { v: [1, 2, 2, 3, 3, 4], dims: ["d", "e"], units: "dBm", funits: "dBm" }],
+  ["e * 10 + v", { v: [1, 2, 3, 11, 12, 13], dims: ["e", "d"], units: "dBm" }],
+  // (funits = a formula def's automatic units: time-like units -> "s", as the values are seconds)
+  ["t", { v: [1 * 1e-9, 2 * 1e-9, 3 * 1e-9], dims: ["d"], units: "ns", funits: "s" }],
+  ["t * v", { dims: ["d"], units: "ns" + DOT + "dBm", funits: "s" + DOT + "dBm" }],
+  // a dim name never means a NON-coordinate variable of that name: the index
+  ["h * 10", { v: [0, 10], dims: ["h"], units: "", funits: "" }],
+  ["s * 2", { v: [0, 2, 4, 6], dims: ["s"], units: "" }],
+  ["w - v", { v: [9, 8, 7, 19, 18, 17], dims: ["e", "d"], units: "dB" }],
+  ["w - v + log10(a) + \"a\"", { names: ["w", "v", "a"], dims: ["e", "d"] }],
+  // units (SPEC_EXPR E1)
+  ["a/b", { v: [2 / 3], units: "" }], ["a*b", { units: "V" + DOT + "V" }], ["a^2", { units: "V^2" }], ["a^-2", { units: "V^-2" }],
+  ["pow(a, 0.5)", { units: "V^0.5" }], ["a^(2)", { units: "V^2" }], ["a^1e21", { units: "V^1e+21" }], ["a^0.1", { units: "V^0.1" }],
+  ["a^2k", { units: "V^2000" }], ["a^1e-7", { units: "V^1e-7" }], ["lin2db(a)", { units: "dB" }], ["db2lin(v)", { units: "mW" }],
+  ["db2lin(a)", { units: "lin(V)" }], ["db2lin(c)", { units: "" }], ["1/a", { units: "1/V" }], ["a + v", { units: "V" }],
+  ["v + a", { units: "dBm" }], ["abs(c) + min(c, a)", { units: "V" }], ["sqrt(a)", { units: "" }], ["-v", { units: "dBm" }],
+  ["v - w", { units: "dB" }], ["v + w", { units: "dBm" }], ["(v - w) + w", { units: "dBm" }], ["a - 1", { units: "V" }],
+  ["1 - a", { units: "V" }], ["v / v", { units: "" }], ["v / a", { units: "dBm/V" }], ["lin2db(db2lin(v))", { units: "dBm" }],
+  ["max(c, v, a)", { units: "dBm" }], ["e + a", { units: "V" }],
+  // errors (pos = 0-based character position, where it is unambiguous)
+  ["", { err: true, pos: -1 }], ["   ", { err: true, pos: -1 }], ["5ms", { err: true, pos: 0 }], ["2e", { err: true, pos: 0 }],
+  ["1.2.3", { err: true, pos: 0 }], ["3x", { err: true, pos: 0 }], ["a b", { err: true, pos: 2 }], ["1 +", { err: true }],
+  ["(1", { err: true }], ["1)", { err: true, pos: 1 }], ["@", { err: true, pos: 0 }], ["a # b", { err: true, pos: 2 }],
+  ["foo(1)", { err: true, pos: 0 }], ["abs()", { err: true }], ["abs(1, 2)", { err: true }], ["pow(1)", { err: true }],
+  ["min()", { err: true }], ['"unterminated', { err: true, pos: 0 }], ['""', { err: true, pos: 0 }],
+  ["unknown + 1", { err: true, pos: 0 }], ["1 + nope", { err: true, pos: 4 }], ["str * 2", { err: true, pos: 0 }],
+  ["a +* b", { err: true, pos: 3 }], ["2 ^", { err: true }], ["max(1,)", { err: true }], [",", { err: true, pos: 0 }],
+  ["1..2", { err: true, pos: 0 }], ["5 m", { err: true, pos: 2 }], [u(0xa0) + "1", { err: true, pos: 0 }],
+  ["1" + u(0x2028), { err: true, pos: 1 }], ["abs", { err: true, pos: 0 }], ['"abs"(2)', { err: true }],
+  ["a(2)", { err: true, pos: 0 }], ["2 3", { err: true, pos: 2 }], ["1e5e", { err: true, pos: 0 }],
+  // positions count UTF-16 units, like the app (an emoji counts 2)
+  ['"' + String.fromCodePoint(0x1f600) + '" + @', { err: true, pos: 7 }],
+  // a quote followed by a letter / digit / _ belongs to the quoted name
+  ['"a"b" + 1', { err: true, pos: 0 }], ['"a"5', { err: true, pos: 0 }], ['"a""b"', { err: true, pos: 3 }],
+  // nesting limit (64, as the app): ( ), signs, ^ and calls
+  ["(".repeat(64) + "1" + ")".repeat(64), { v: [1] }], ["(".repeat(65) + "1" + ")".repeat(65), { err: true, pos: 64 }],
+  ["-".repeat(65) + "1", { err: true, pos: 64 }], ["2^".repeat(65) + "1", { err: true, pos: 129 }],
+  ["abs(".repeat(65) + "1" + ")".repeat(65), { err: true, pos: 256 }], ["-".repeat(64) + "1", { v: [1] }],
+  // C99 pow even for the exponent 0.5 (numpy would take sqrt), sign of zero in min / max
+  ["(-1/0)^0.5", { v: [Infinity] }], ["1/(-0)^0.5", { v: [Infinity] }], ["1/pow(-0, 0.5)", { v: [Infinity] }],
+  ["1/min(-0, 0)", { v: [-Infinity] }], ["1/min(0, -0)", { v: [-Infinity] }], ["1/max(0, -0)", { v: [Infinity] }],
+  ["1/max(-0, -0)", { v: [-Infinity] }], ["1/max(-0, -5)", { v: [-Infinity] }], ["1/min(0, 5)", { v: [Infinity] }],
+];
+const NAME_ERRORS = new Set(["unknown + 1", "1 + nope", "str * 2", "abs", '"a"b" + 1']);   // not syntax errors
+const MIGRATE_INPUTS = [];          // filled by jsChecks (the migrateWindow cases)
+const JS_STR_VALUES = [0, 1, -1, 0.5, 2, 1e21, 1e20, 1e-7, 1e-6, 1.5e-6, 123.456, 2.5e-7, 0.1 + 0.2, 1 / 3, 5e-324,
+  1.7976931348623157e308, 123456789012345680000, 1e100, -1.5e-10, 100, 3e6, 1000000, 0.02, 31e6, -5e6, 1234.5e-12];
+
+function checkExprProbe(out, req) {
+  const bad = [];
+  EXPR_CASES.forEach(([text, want], i) => {
+    const got = out.exprs[i];
+    if (want.err) {
+      if (!got.error || (want.pos !== undefined && got.pos !== want.pos)) bad.push([text, "want error", want.pos, got]);
+      return;
+    }
+    if (got.error) { bad.push([text, "unexpected error", got.error]); return; }
+    const data = got.data.map((x) => (typeof x === "string" ? Number(x) : x));
+    if (want.v && !(data.length === want.v.length && data.every((x, k) => (Number.isNaN(want.v[k]) ? Number.isNaN(x)
+      : !Number.isFinite(want.v[k]) ? x === want.v[k] : close(x, want.v[k], 1e-12)))))
+      bad.push([text, "value", got.data, want.v]);
+    if (want.dims && JSON.stringify(got.dims) !== JSON.stringify(want.dims)) bad.push([text, "dims", got.dims, want.dims]);
+    if (want.units !== undefined && got.units !== want.units) bad.push([text, "units", got.units, want.units]);
+    if (want.funits !== undefined && got.funits !== want.funits) bad.push([text, "funits", got.funits, want.funits]);
+    if (want.names && JSON.stringify(got.names) !== JSON.stringify(want.names)) bad.push([text, "names", got.names, want.names]);
+    // the tolerant dependency scan (Python expr_refs == JS exprRefs) finds the same names on valid text
+    if (JSON.stringify(got.refs) !== JSON.stringify(P.exprRefs(text)) || JSON.stringify(got.refs) !== JSON.stringify(got.names))
+      bad.push([text, "refs", got.refs, P.exprRefs(text), got.names]);
+  });
+  check(`python expressions: ${EXPR_CASES.length} cases (values, dims, units, names, errors + positions)`, bad.length === 0, bad.slice(0, 6));
+
+  const mig = req.migrate.map((w, i) => [w, P.migrateWindow(w), out.migrate[i]])
+    .filter(([, js, py]) => JSON.stringify(js) !== JSON.stringify(py));
+  check(`python migrate_window == JS migrateWindow (${req.migrate.length} windows)`, req.migrate.length > 5 && mig.length === 0, mig);
+  const jbad = JS_STR_VALUES.map((x, i) => [x, String(x), out.js_str[i]]).filter(([, a, b]) => a !== b);
+  check(`python js_str == JS String(x) (${JS_STR_VALUES.length} values)`, jbad.length === 0, jbad);
+
+  // docs/js/expr.js (the web app's engine), when present: same values / errors / units
+  if (!E) { skip("python expressions vs docs/js/expr.js", "expr.js not available"); return; }
+  const SC = { a: 2, b: 3, c: NaN }, SU = { a: "V", b: "V", c: "" };
+  const xbad = [];
+  let n = 0;
+  EXPR_CASES.forEach(([text, want], i) => {
+    const got = out.exprs[i];
+    if (got.error && NAME_ERRORS.has(text)) return;
+    const scalar = !got.error && (got.names || []).every((nm) => nm in SC || nm === "pi");
+    if (!got.error && !scalar) return;
+    n++;
+    // a syntax error may surface in parseExpr or (unknown function / arity) in evalExpr
+    const lookup = (nm) => (nm in SC ? SC[nm] : nm === "pi" ? Math.PI : NaN);
+    let ast = null, r = null, jsErr = null;
+    try { ast = E.parseExpr(text); r = E.evalExpr(ast, lookup, 1); } catch (e) { jsErr = e; }
+    if (got.error) { if (!jsErr) xbad.push([text, "python error, expr.js computes", got.error]); return; }
+    if (jsErr) { xbad.push([text, "expr.js error", jsErr.message]); return; }
+    try {
+      const v = r[0], pv = typeof got.data[0] === "string" ? Number(got.data[0]) : got.data[0];
+      if (!(Number.isNaN(v) ? Number.isNaN(pv) : !Number.isFinite(v) ? v === pv : close(v, pv, 1e-12))) xbad.push([text, "value", v, pv]);
+      if (typeof E.exprUnits === "function") {
+        const ju = E.exprUnits(ast, (nm) => SU[nm] || "");
+        if (ju !== got.units) xbad.push([text, "units", ju, got.units]);
+      }
+    } catch (e) { xbad.push([text, "expr.js threw", e.message]); }
+  });
+  check(`python expressions == docs/js/expr.js (${n} cases)`, xbad.length === 0, xbad.slice(0, 6));
 }
 
 async function compareDerived(tag, cs, cfg, der, filePath) {
@@ -819,17 +1346,27 @@ async function compareDerived(tag, cs, cfg, der, filePath) {
         && JSON.stringify(pv.shape) === JSON.stringify(rv.shape), [pv.dims, rv.dims, pv.shape, rv.shape]);
       check(`${tag}: ${d.name} values vs reference (rel 1e-9)`, arrClose(pv.data, Array.from(rv.data), 1e-9),
         firstDiff(pv.data, Array.from(rv.data), 1e-9));
-      check(`${tag}: ${d.name} units vs reference`, pv.units === rv.units, [pv.units, rv.units]);
+      if (rv.units !== null) check(`${tag}: ${d.name} units vs reference`, pv.units === rv.units, [pv.units, rv.units]);
       if (cs.units && d.name in cs.units) check(`${tag}: ${d.name} units '${cs.units[d.name]}'`, pv.units === cs.units[d.name], pv.units);
+      else if (rv.units === null) check(`${tag}: ${d.name} has expected units listed in the case`, false);
     }
-    // (b) derive.js (the web app's engine)
+    for (const [name, want] of Object.entries(cs.expectValues || {})) {
+      const pv = pyF[name];
+      check(`${tag}: ${name} == ${JSON.stringify(want).slice(0, 60)}`, pv && arrClose(pv.data, want, 1e-12), pv && pv.data);
+    }
+    for (const [name, want] of Object.entries(cs.dimsOf || {})) {
+      const pv = pyF[name];
+      check(`${tag}: ${name} dims ${JSON.stringify(want)}`, pv && JSON.stringify(pv.dims) === JSON.stringify(want), pv && pv.dims);
+    }
+    // (b) derive.js (the web app's engine), on the defs it would load from a
+    // project (sanitizeDef migrates legacy windows; null = refused)
     if (!D) continue;
     const ds = await loadDataset(filePath[file]);
-    const st = D.registerDerived(ds, fdefs);
+    const st = D.registerDerived(ds, jsDefs(fdefs));
     for (const d of fdefs) {
       const s = st.get(d.name), pv = pyF[d.name];
       const expectErr = (cs.derivedErrors || []).includes(d.name);
-      if (expectErr) { check(`${tag}: ${d.name} fails in derive.js too`, s && !s.ok, s); continue; }
+      if (expectErr) { check(`${tag}: ${d.name} fails in derive.js too`, !s || !s.ok, s); continue; }
       if (!check(`${tag}: ${d.name} ok in derive.js`, s && s.ok, s)) continue;
       const v = ds.vars[d.name];
       check(`${tag}: ${d.name} python vs derive.js dims`, JSON.stringify(v.dims) === JSON.stringify(pv.dims));
@@ -844,14 +1381,24 @@ async function compareLines(tag, cs, cfg, lines, der, filePath) {
   const derivedNames = new Set(cfg.derived.map((d) => d.file + "\u0000" + d.name));
   const usesDerived = (t) => [t.var, t.xsrc.startsWith("var:") ? t.xsrc.slice(4) : "", t.ssrc.startsWith("var:") ? t.ssrc.slice(4) : ""]
     .some((n) => n && derivedNames.has(t.file + "\u0000" + n));
-  const derivedDs = new Map();      // file -> Dataset with derive.js vars registered
+  // file -> Dataset with the derived vars: computed by derive.js when it is
+  // usable, else the script's own dumped values (then this checks how the
+  // script turns derived variables into lines, not how it computes them)
+  const derivedDs = new Map();
   const dsFor = async (t) => {
     if (!filePath[t.file]) return null;
     if (!usesDerived(t)) return plainDs(filePath[t.file]);
-    if (!D) return null;
     if (!derivedDs.has(t.file)) {
       const ds = await loadDataset(filePath[t.file]);
-      D.registerDerived(ds, cfg.derived.filter((d) => d.file === t.file));
+      if (D) D.registerDerived(ds, jsDefs(cfg.derived.filter((d) => d.file === t.file)));
+      else {
+        for (const [name, e] of Object.entries(der[t.file] || {})) {
+          const v = new Variable(name, { dims: e.dims, shape: e.shape, attrs: { units: e.units }, dtype: "double",
+            numeric: true, data: Float64Array.from(e.data, (x) => (x === null ? NaN : x)) });
+          v.derived = true;
+          ds.vars[name] = v;
+        }
+      }
       derivedDs.set(t.file, ds);
     }
     return derivedDs.get(t.file);
@@ -893,7 +1440,9 @@ jsChecks();
 if (!pyAvailable()) {
   skip("all script runs", `no usable Python at '${PYTHON}' (needs numpy xarray matplotlib scipy pypdf); set NCX_PYTHON`);
 } else {
+  const only = process.env.NCX_CASES ? process.env.NCX_CASES.split(",") : null;   // e.g. NCX_CASES=A,I
   for (const cs of buildCases()) {
+    if (only && !only.some((p) => cs.id.startsWith(p))) { skip(cs.id, "not in NCX_CASES"); continue; }
     try { await runCase(cs); }
     catch (e) { check(`${cs.id}: no exception in the test harness`, false, e.stack); }
   }

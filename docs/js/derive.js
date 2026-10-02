@@ -1,15 +1,23 @@
 // derive.js — derived quantities: virtual variables computed from the ones in a
-// Dataset. Three kinds of definition ("def"): a windowed statistic over one dim
-// (reduce), an elementwise binary op broadcast by dim NAME (combine), and a
-// unary function (transform). A computed def is registered as an ordinary
-// numeric Variable (flag .derived, .def = canonical def) in ds.vars, so traces,
-// x sources and sweep sources use it like any other variable; defs may chain.
+// Dataset. Kinds of definition ("def"): a windowed statistic over one dim
+// (reduce) whose window bounds are expressions (e.g. center stimulusFrequency,
+// half width 0.01*stimulusFrequency), a free formula over variables and dims
+// broadcast by dim NAME (formula, e.g. peak - floor), and — still computed for
+// older projects — an elementwise binary op (combine) and a unary function
+// (transform). The expression language lives in expr.js. A computed def is
+// registered as an ordinary numeric Variable (flag .derived, .def = canonical
+// def) in ds.vars, so traces, x sources, sweep sources and other defs use it
+// like any other variable.
 // Pure: no DOM, no Node APIs — the same module runs in the browser and in the
 // Node tests. The semantics are mirrored by the Python report script, so any
 // change here must be made there too.
 
 import { Variable } from "./dataset.js";
 import { asFloatArray } from "./explore.js";
+import { FUNCTIONS, ExprError, parseExpr, exprRefs, exprNames, evalExpr, exprUnits, quoteName, num,
+  renameInExpr } from "./expr.js";
+
+export { FUNCTIONS, quoteName } from "./expr.js";
 
 export const STATS = [
   { id: "max", label: "Peak (max)", hint: "largest value in the region" },
@@ -42,8 +50,8 @@ export const TRANSFORMS = [
 ];
 export const WINDOW_MODES = [
   { id: "none", label: "Whole span" },
-  { id: "fixed", label: "Fixed x range" },
-  { id: "relative", label: "Relative to a coordinate/variable" },
+  { id: "range", label: "From … to …" },
+  { id: "center", label: "Center ± half width" },
 ];
 export const DB_MODES = [
   { id: "auto", label: "Auto (from units)" },
@@ -52,11 +60,16 @@ export const DB_MODES = [
 ];
 export const MAX_DERIVED = 256;
 export const NAME_RE = /^[A-Za-z0-9_][A-Za-z0-9_ .+\-]{0,63}$/;
+export const KINDS = ["reduce", "combine", "transform", "formula"];
+// length caps of the expression strings (window fields / formula). 320, not
+// 300: a migrated bc9812f center "k*<256-char name> + offset" can be 311
+// characters long, and cutting it would change what it computes.
+export const EXPR_MAX = 320, FORMULA_MAX = 1000;
 
-const KINDS = ["reduce", "combine", "transform"];
 const idSet = (list) => new Set(list.map((e) => e.id));
 const STAT_IDS = idSet(STATS), REGION_IDS = idSet(REGIONS), OP_IDS = idSet(OPS),
   FN_IDS = idSet(TRANSFORMS), MODE_IDS = idSet(WINDOW_MODES), DB_IDS = idSet(DB_MODES);
+const FN_NAMES = new Set(FUNCTIONS.map((f) => f.name));
 const label = (list, id) => (list.find((e) => e.id === id) || { label: id }).label;
 
 // kernel codes (ints keep the hot loop monomorphic)
@@ -100,6 +113,10 @@ function numCoord(ds, dim) {
 }
 const f64 = (a) => (a instanceof Float64Array ? a : Float64Array.from(a, Number));
 const scaled = (v) => asFloatArray(v.data, v.attrs && v.attrs.units);   // time units -> s
+// the same values without a copy when nothing would change (float64 data,
+// units that are not time-like); the caller must not write into the result
+const scaledRO = (v) => (v.data instanceof Float64Array && asFloatArray([1], v.attrs && v.attrs.units)[0] === 1
+  ? v.data : scaled(v));
 const iota = (n) => { const a = new Float64Array(n); for (let i = 0; i < n; i++) a[i] = i; return a; };
 // names that are Object.prototype members ("__proto__", "constructor", ...) are
 // refused: ds.vars is a plain object, so ds.vars["__proto__"] = v would replace
@@ -107,6 +124,7 @@ const iota = (n) => { const a = new Float64Array(n); for (let i = 0; i < n; i++)
 const reserved = (name) => hasOwn(Object.prototype, name);
 const sameFile = (ds, d) => !d.file || !ds || !ds.filename || d.file === ds.filename;
 const refName = (s, pre) => (typeof s === "string" && s.startsWith(pre) ? s.slice(pre.length) : null);
+const oneLine = (s) => String(s ?? "").replace(/\s*[\r\n]+\s*/g, " ").trim();
 
 // %g-style number text for descriptions (1e6 -> "1e+06", 0.02 -> "0.02")
 function fmtG(x) {
@@ -124,6 +142,230 @@ export function trimUnits(u) { return String(u ?? "").trim(); }
 export function isDb(u) { return trimUnits(u).toLowerCase().includes("db"); }
 const norm = (u) => trimUnits(u).toLowerCase();
 
+// ---- windows: expression fields, and the bc9812f (legacy) form -------------------
+// new form: { mode: none|range|center, lo, hi, lo2, hi2, center, halfwidth,
+// halfwidth2 } — every field an expression string ("" = not set)
+const WIN_FIELDS = ["lo", "hi", "lo2", "hi2", "center", "halfwidth", "halfwidth2"];
+const MODE_FIELDS = { none: [], range: ["lo", "hi", "lo2", "hi2"], center: ["center", "halfwidth", "halfwidth2"] };
+const INNER = { range: ["lo", "hi"], center: ["center", "halfwidth"] };
+const OUTER = { range: ["lo2", "hi2"], center: ["halfwidth2"] };
+const FIELD_LABEL = { lo: "from", hi: "to", lo2: "outer from", hi2: "outer to", center: "center",
+  halfwidth: "half width", halfwidth2: "outer half width" };
+const emptyWindow = (mode) => ({ mode, lo: "", hi: "", lo2: "", hi2: "", center: "", halfwidth: "", halfwidth2: "" });
+// an expression field: strings capped as-is, finite numbers as num(x), else ""
+const exprStr = (v, max) => (typeof v === "string" ? v.slice(0, max) : isFin(v) ? num(v).slice(0, max) : "");
+
+// the expressions a window needs: the inner ones (mode != none), plus the
+// outer ones for region outside_within
+function neededFields(mode, region) {
+  if (!hasOwn(INNER, mode)) return [];
+  return region === "outside_within" ? [...INNER[mode], ...OUTER[mode]] : INNER[mode].slice();
+}
+
+// A window as saved by bc9812f: mode fixed/relative; or, with mode none or
+// missing, a k/offset key (bc9812f always wrote both), a number in a field, or
+// a "coord:"/"var:" center with no other expression text (a hand-written old
+// window). A mode none window with typed expressions is NOT legacy, whatever
+// its center says. pyexport.js (migrateWindow and the script's
+// migrate_window) uses the same rule.
+function isLegacyWindow(w) {
+  const mode = own(w, "mode");
+  if (mode === "fixed" || mode === "relative") return true;
+  if (mode === "range" || mode === "center") return false;
+  if (hasOwn(w, "k") || hasOwn(w, "offset") || WIN_FIELDS.some((k) => typeof own(w, k) === "number")) return true;
+  const c = own(w, "center");
+  return typeof c === "string" && /^(coord|var):/.test(c)
+    && WIN_FIELDS.every((k) => k === "center" || typeof own(w, k) !== "string" || own(w, k) === "");
+}
+// Legacy -> new form: fixed -> range (bounds as num(x)); relative -> center
+// "[k*]name [± offset]" with |half widths|. It computes exactly the old
+// numbers: k*c + offset == (k*c) - (-offset) in IEEE arithmetic, and the
+// number texts round-trip. Never cut: with bc9812f's 256-character names the
+// center is at most 311 characters (< EXPR_MAX).
+function migrateWindow(w) {
+  const mode = own(w, "mode");
+  const fin = (v) => (isFin(v) ? num(v) : "");
+  if (mode === "fixed") {
+    const out = emptyWindow("range");
+    for (const k of ["lo", "hi", "lo2", "hi2"]) out[k] = fin(own(w, k));
+    return out;
+  }
+  if (mode !== "relative") return emptyWindow(mode == null || mode === "none" ? "none" : mode);
+  const out = emptyWindow("center");
+  const c = own(w, "center");
+  const name = (refName(c, "coord:") ?? refName(c, "var:") ?? "").slice(0, 256);
+  if (name) {
+    const kv = own(w, "k"), ov = own(w, "offset");
+    const k = isFin(kv) ? kv : 1, off = isFin(ov) ? ov : 0;
+    const q = quoteName(name);
+    out.center = (k === 1 ? q : `${num(k)}*${q}`)
+      + (off === 0 ? "" : off < 0 ? ` - ${num(-off)}` : ` + ${num(off)}`);
+  }
+  const hw = own(w, "halfwidth"), hw2 = own(w, "halfwidth2");
+  out.halfwidth = isFin(hw) ? num(Math.abs(hw)) : "";
+  out.halfwidth2 = isFin(hw2) ? num(Math.abs(hw2)) : "";
+  return out;
+}
+// any window object -> the new form (legacy migrated); no validation. A
+// missing or null mode is "none" (as bc9812f and the report script read it;
+// sanitizeDef still rejects a null mode, like bc9812f)
+function canonicalWindow(w) {
+  const o = isObj(w) ? w : {};
+  if (isLegacyWindow(o)) return migrateWindow(o);
+  const mode = own(o, "mode");
+  const out = { mode: mode == null ? "none" : mode };
+  for (const k of WIN_FIELDS) out[k] = exprStr(own(o, k), EXPR_MAX);
+  return out;
+}
+// untrusted window -> the new form, or null (unknown mode; a legacy window
+// with a center that is not "", "coord:<name>" or "var:<name>", as bc9812f)
+function sanitizeWindow(w) {
+  const mode = own(w, "mode");
+  if (isLegacyWindow(w)) {
+    if (![undefined, "none", "fixed", "relative"].includes(mode)) return null;
+    const c = own(w, "center");
+    if (c !== undefined && c !== "" && !(typeof c === "string" && /^(coord|var):[\s\S]/.test(c))) return null;
+    return migrateWindow(w);
+  }
+  if (!MODE_IDS.has(mode === undefined ? "none" : mode)) return null;
+  return canonicalWindow(w);
+}
+
+// ---- expressions: parse cache + name resolution ------------------------------------
+const _parsed = new Map();
+// AST of `text` (shared — never mutated) or throws ExprError
+function parseCached(text) {
+  let r = _parsed.get(text);
+  if (!r) {
+    try { r = { ast: parseExpr(text) }; } catch (e) {
+      if (!(e instanceof ExprError)) throw e;
+      r = { err: e };
+    }
+    if (_parsed.size >= 500) _parsed.clear();
+    _parsed.set(text, r);
+  }
+  if (r.err) throw r.err;
+  return r.ast;
+}
+const namesOf = (text) => { try { return exprNames(parseCached(text)); } catch (e) { return []; } };
+
+// What `name` stands for in ds (in this order): a numeric variable (real or
+// derived) | a dimension (its index 0..n-1) | the constant pi. A dimension
+// name means the dimension's own numeric 1-D coordinate variable, else its
+// index — never a non-coordinate variable that happens to share its name
+// (legal in NetCDF-3; bc9812f's "coord:<dim>" centers and the x source "coord"
+// read it the same way). A non-numeric variable is an error, even one named
+// pi. Throws ExprError. The Python script's resolve_name() is the same rule.
+function resolveName(ds, name, pos) {
+  const v = getVar(ds, name);
+  const isDim = !!ds && hasOwn(ds.dims, name);
+  if (v && isNumVar(v) && (!isDim || numCoord(ds, name))) {
+    if (v.shape.length !== v.dims.length || v.data.length !== prod(v.shape))
+      throw new ExprError(`'${name}' data does not match its shape`, pos);
+    return { name, pos, kind: "var", v, dims: v.dims, shape: v.shape };
+  }
+  if (isDim) return { name, pos, kind: "dim", dims: [name], shape: [ds.dims[name]] };
+  if (v) throw new ExprError(`'${name}' is not numeric`, pos);
+  if (name === "pi") return { name, pos, kind: "const", dims: [], shape: [] };
+  throw new ExprError(`unknown name '${name}'`, pos);
+}
+// units of a name in a formula: those of the variable it resolves to, but "s"
+// for time-like units (its values are converted to seconds, see scaledRO) so a
+// derived result is not labelled 'ns' and scaled again where it is used; ""
+// for a dimension index, pi or an unknown name
+function nameUnits(ds, name) {
+  let b;
+  try { b = resolveName(ds, name, -1); } catch (e) { return ""; }
+  if (b.kind !== "var") return "";
+  const u = unitsOf(b.v);
+  return u && asFloatArray([1], u)[0] !== 1 ? "s" : u;
+}
+// Resolve every name of `ast` (first appearance first). `self` (the def's own
+// name) may not appear. With `dims` (the result dims) the dims rule applies:
+// every dim of a name must be a result dim, of the same size.
+function bindNames(ds, ast, self, dims, shape) {
+  return exprRefs(ast).map(({ name, pos }) => {
+    if (self && name === self) throw new ExprError(`'${name}' refers to this quantity itself`, pos);
+    const b = resolveName(ds, name, pos);
+    if (dims) {
+      b.dims.forEach((d, i) => {
+        const j = dims.indexOf(d);
+        if (j < 0) throw new ExprError(`'${name}' has dimension '${d}', which the result lacks`, pos);
+        if (shape[j] !== b.shape[i]) throw new ExprError(`'${d}' has a different size in '${name}'`, pos);
+      });
+    }
+    return b;
+  });
+}
+// values with dims `vd`/shape `vs` (C order) broadcast onto (dims, shape) by
+// dim NAME (vd ⊆ dims); the input itself when the layout is already the same
+function broadcast(vals, vd, vs, dims, shape) {
+  if (vd.length === dims.length && vd.every((d, i) => d === dims[i])) return vals;
+  const st = stridesOf(vs);
+  const str = dims.map((d) => { const i = vd.indexOf(d); return i < 0 ? 0 : st[i]; });
+  const total = prod(shape), nd = dims.length;
+  const out = new Float64Array(total), idx = new Int32Array(nd);
+  let o = 0;
+  for (let f = 0; f < total; f++) {
+    out[f] = vals[o];
+    for (let d = nd - 1; d >= 0; d--) {         // odometer over (dims, shape)
+      o += str[d];
+      if (++idx[d] < shape[d]) break;
+      o -= str[d] * shape[d];
+      idx[d] = 0;
+    }
+  }
+  return out;
+}
+// evalExpr lookups: every bound name over the whole result (dims, shape) ...
+function lookupAll(binds, dims, shape) {
+  const m = new Map(binds.map((b) => [b.name, b]));
+  return (name) => {
+    const b = m.get(name);
+    if (!b || b.kind === "const") return undefined;          // pi
+    if (b.kind === "dim") return broadcast(iota(b.shape[0]), b.dims, b.shape, dims, shape);
+    const vals = scaledRO(b.v);                 // evalExpr never writes into a lookup's array
+    return b.dims.length ? broadcast(vals, b.dims, b.shape, dims, shape) : vals[0];
+  };
+}
+// ... or at one result multi-index `idx` (same arithmetic, one element)
+function lookupAt(binds, dims, idx) {
+  const m = new Map(binds.map((b) => [b.name, b]));
+  return (name) => {
+    const b = m.get(name);
+    if (!b || b.kind === "const") return undefined;
+    if (b.kind === "dim") return idx[dims.indexOf(name)];
+    const st = stridesOf(b.shape);
+    let off = 0;
+    b.dims.forEach((d, i) => { off += idx[dims.indexOf(d)] * st[i]; });
+    return asFloatArray([b.v.data[off]], b.v.attrs && b.v.attrs.units)[0];
+  };
+}
+// a formula's AST + bindings + result dims: the dims of each referenced name,
+// first appearance first, broadcast by dim name. Throws ExprError.
+function formulaCore(ds, def, text) {
+  const ast = parseCached(text);
+  const binds = bindNames(ds, ast, def.name, null, null);
+  const dims = [], shape = [], from = [];
+  for (const b of binds) {
+    b.dims.forEach((d, i) => {
+      const j = dims.indexOf(d);
+      if (j < 0) { dims.push(d); shape.push(b.shape[i]); from.push(b.name); }
+      else if (shape[j] !== b.shape[i])
+        throw new ExprError(`'${d}' has size ${shape[j]} in '${from[j]}' but ${b.shape[i]} in '${b.name}'`, b.pos);
+    });
+  }
+  return { ast, binds, dims, shape };
+}
+// result dims of a reduce (null when src/over are not usable)
+function reduceDims(ds, def) {
+  const v = getVar(ds, def.src);
+  if (!isNumVar(v) || !v.dims.length) return null;
+  const ax = v.dims.indexOf(def.over);
+  if (ax < 0) return null;
+  return { dims: v.dims.filter((_, i) => i !== ax), shape: v.shape.filter((_, i) => i !== ax) };
+}
+
 // ---- def records ------------------------------------------------------------
 const head = (d, kind) => ({
   name: d.name, file: d.file, kind, units: d.units, description: d.description,
@@ -134,31 +376,27 @@ export function newDef(kind, file) {
   if (kind === "combine") return { ...head(base, "combine"), a: "", op: "-", b: "" };
   if (kind === "transform")
     return { ...head(base, "transform"), src: "", fn: "db2lin", scale: 1, offset: 0 };
+  if (kind === "formula") return { ...head(base, "formula"), expr: "" };
   return {        // unknown kinds get a reduce (the main use)
     ...head(base, "reduce"), src: "", over: "", xsrc: "index",
-    window: { mode: "none", lo: null, hi: null, lo2: null, hi2: null, center: "", k: 1,
-      offset: 0, halfwidth: null, halfwidth2: null },
-    region: "inside", stat: "max", db: "auto",
+    window: emptyWindow("none"), region: "inside", stat: "max", db: "auto",
   };
 }
 
-// deep copy in canonical key order (§1.1). No validation: values are copied
-// as-is (missing ones take the newDef defaults), so a half-edited def survives.
+// deep copy in canonical key order (§1.1 / E2). No validation: values are
+// copied as-is (missing ones take the newDef defaults), so a half-edited def
+// survives — except that expression fields are always strings (numbers as
+// num(x), capped) and a legacy window is migrated to the new form.
 export function canonicalDef(def) {
   const d = isObj(def) ? def : {};
   const kind = own(d, "kind") === undefined ? "reduce" : own(d, "kind");
   const dflt = newDef(KINDS.includes(kind) ? kind : "reduce", "");
-  const pick = (o, base, k) => (own(o, k) === undefined ? base[k] : own(o, k));
   const out = {};
   for (const k of Object.keys(dflt)) {
-    if (k === "kind") { out.kind = kind; continue; }
-    if (k === "window") {
-      const w = isObj(own(d, "window")) ? d.window : {};
-      out.window = {};
-      for (const wk of Object.keys(dflt.window)) out.window[wk] = pick(w, dflt.window, wk);
-      continue;
-    }
-    out[k] = pick(d, dflt, k);
+    if (k === "kind") out.kind = kind;
+    else if (k === "window") out.window = canonicalWindow(own(d, "window"));
+    else if (k === "expr") out.expr = exprStr(own(d, "expr"), FORMULA_MAX);
+    else out[k] = own(d, k) === undefined ? dflt[k] : own(d, k);
   }
   return out;
 }
@@ -167,19 +405,21 @@ export function canonicalDef(def) {
 // null. Policy: only own properties are read (so "__proto__"/"constructor"
 // keys can't inject anything — they are simply never looked at) and the output
 // is a fresh object literal.
-//  - kind must be reduce|combine|transform, and the name must match NAME_RE
-//    after trimming/capping to 64 chars — otherwise null.
-//  - enum fields (stat, region, db, window.mode, op, fn, xsrc, window.center):
-//    a MISSING value takes the default; a present but unrecognized value
-//    rejects the def (substituting a default would silently change what is
-//    computed — better to drop it).
+//  - kind must be reduce|combine|transform|formula, and the name must match
+//    NAME_RE after trimming/capping to 64 chars — otherwise null.
+//  - enum fields (stat, region, db, window.mode, op, fn, xsrc): a MISSING value
+//    takes the default; a present but unrecognized value rejects the def
+//    (substituting a default would silently change what is computed).
 //  - free strings (file, units, description) of the wrong type become "";
 //    capped: units 32 (trimmed), description 200, file and var names 256.
 //  - var-name fields (src, over, a, b) of the wrong type become "" (the def is
 //    kept and validateDef reports it, so the user can repair it); b may also be
 //    a finite number.
-//  - number fields: finite numbers or null (lo/hi/lo2/hi2/halfwidth/2);
-//    k/scale default 1 and offset 0 when not a finite number.
+//  - expression fields (window fields, formula expr): strings capped at 320 /
+//    1000 chars (not trimmed), finite numbers -> num(x), anything else "".
+//  - a legacy (bc9812f) window is migrated (see migrateWindow); its center must
+//    be "", "coord:<name>" or "var:<name>" as before.
+//  - transform: scale defaults to 1 and offset to 0 when not a finite number.
 export function sanitizeDef(raw) {
   if (!isObj(raw)) return null;
   const kind = own(raw, "kind");
@@ -196,6 +436,7 @@ export function sanitizeDef(raw) {
   const out = head({ name, file: s(own(raw, "file"), 256, false), units: s(own(raw, "units"), 32, true),
     description: s(own(raw, "description"), 200, true) }, kind);
 
+  if (kind === "formula") return { ...out, expr: exprStr(own(raw, "expr"), FORMULA_MAX) };
   if (kind === "combine") {
     const op = en(own(raw, "op"), OP_IDS, "-");
     if (op === undefined) return null;
@@ -209,46 +450,40 @@ export function sanitizeDef(raw) {
       scale: numOr(own(raw, "scale"), 1), offset: numOr(own(raw, "offset"), 0) };
   }
   // reduce
-  const ref = (v, prefixes, d) => {              // "<prefix><name>" with 1..256 name chars
-    if (v === undefined || v === d) return d;
-    if (typeof v !== "string") return undefined;
-    if (prefixes.fixed && prefixes.fixed.includes(v)) return v;
-    for (const p of prefixes.refs) {
-      if (v.startsWith(p) && v.length > p.length) return p + v.slice(p.length, p.length + 256);
-    }
-    return undefined;
-  };
-  const xsrc = ref(own(raw, "xsrc"), { fixed: ["index", "coord"], refs: ["var:"] }, "index");
+  let xsrc = own(raw, "xsrc");                   // index | coord | var:<1..256 chars>
+  if (xsrc === undefined) xsrc = "index";
+  else if (typeof xsrc !== "string") xsrc = undefined;
+  else if (xsrc !== "index" && xsrc !== "coord") {
+    xsrc = xsrc.startsWith("var:") && xsrc.length > 4 ? "var:" + xsrc.slice(4, 260) : undefined;
+  }
   let w = own(raw, "window");
   if (w === undefined) w = {};
   if (!isObj(w)) return null;
-  const mode = en(own(w, "mode"), MODE_IDS, "none");
-  const center = ref(own(w, "center"), { refs: ["coord:", "var:"] }, "");
+  const window = sanitizeWindow(w);
   const region = en(own(raw, "region"), REGION_IDS, "inside");
   const stat = en(own(raw, "stat"), STAT_IDS, "max");
   const db = en(own(raw, "db"), DB_IDS, "auto");
-  if ([xsrc, mode, center, region, stat, db].includes(undefined)) return null;
-  const nn = (k) => numOr(own(w, k), null);
+  if (window === null || [xsrc, region, stat, db].includes(undefined)) return null;
   return {
     ...out, src: vname(own(raw, "src")), over: vname(own(raw, "over")), xsrc,
-    window: { mode, lo: nn("lo"), hi: nn("hi"), lo2: nn("lo2"), hi2: nn("hi2"), center,
-      k: numOr(own(w, "k"), 1), offset: numOr(own(w, "offset"), 0),
-      halfwidth: nn("halfwidth"), halfwidth2: nn("halfwidth2") },
-    region, stat, db,
+    window, region, stat, db,
   };
 }
 
-// var names a def reads (src / a / b / x source / center), deduped, in order
+// names a def reads (src / a / b / x source / the needed window expressions /
+// the formula), deduped, in order. Expression names may also be dims or pi.
 export function depsOf(def) {
   if (!isObj(def)) return [];
   const out = [];
   const add = (n) => { if (typeof n === "string" && n && !out.includes(n)) out.push(n); };
   if (def.kind === "combine") { add(def.a); add(def.b); }
   else if (def.kind === "transform") add(def.src);
+  else if (def.kind === "formula") namesOf(exprStr(def.expr, FORMULA_MAX)).forEach(add);
   else {
     add(def.src);
     add(refName(def.xsrc, "var:"));
-    add(refName(isObj(def.window) ? def.window.center : "", "var:"));
+    const w = canonicalWindow(def.window);
+    for (const f of neededFields(w.mode, def.region ?? "inside")) namesOf(w[f]).forEach(add);
   }
   return out;
 }
@@ -287,13 +522,19 @@ export function topoOrder(defs) {
   return { order, errors };
 }
 
-// name rules (§1): pattern, not a real variable or a dim of this file, unique
-// among this file's defs (`ignoreName` = the def being renamed/edited)
+// name rules (§1, E2): pattern, not a real variable or a dim of this file, not
+// a function name or pi, unique among this file's defs (`ignoreName` = the def
+// being renamed/edited). The function-name/pi rule spares `ignoreName` itself:
+// projects saved by bc9812f may hold a def named e.g. "floor", which must keep
+// computing (expressions still reach it: a bare name not followed by "(" is a
+// reference, and quoteName quotes it).
 export function validateName(ds, defs, name, ignoreName) {
   if (typeof name !== "string" || !name.trim()) return "Enter a name.";
   if (!NAME_RE.test(name))
     return "Names start with a letter, digit or _, then letters, digits, space, _ . + - (max 64 characters).";
   if (reserved(name)) return `'${name}' is a reserved name.`;
+  if ((FN_NAMES.has(name) || name === "pi") && name !== ignoreName)
+    return `'${name}' is ${name === "pi" ? "the constant pi" : "a function"} in expressions — choose another name.`;
   const v = getVar(ds, name);
   if (v && !v.derived) return `'${name}' is already a variable in ${(ds && ds.filename) || "this file"}.`;
   if (ds && hasOwn(ds.dims, name)) return `'${name}' is a dimension name.`;
@@ -324,7 +565,21 @@ function resolve(ds, def) {
   if (self) fail(`'${def.name}' refers to itself.`);
   if (def.kind === "combine") return resolveCombine(ds, def);
   if (def.kind === "transform") return resolveTransform(ds, def);
+  if (def.kind === "formula") return resolveFormula(ds, def);
   return resolveReduce(ds, def);
+}
+
+// one needed window expression: parsed + bound over the result dims
+function windowField(ds, def, text, field, dims, shape) {
+  const what = `Window '${FIELD_LABEL[field]}'`;
+  if (!text.trim()) fail(`${what} is empty — enter an expression.`);
+  try {
+    const ast = parseCached(text);
+    return { field, ast, binds: bindNames(ds, ast, def.name, dims, shape) };
+  } catch (e) {
+    if (e instanceof ExprError) fail(`${what}: ${e.message}`);
+    throw e;
+  }
 }
 
 function resolveReduce(ds, def) {
@@ -353,57 +608,18 @@ function resolveReduce(ds, def) {
     xkind = "var";
   } else if (xsrc !== "index") fail(`Unknown x source '${xsrc}'.`);
 
-  const w = isObj(def.window) ? def.window : {};
-  const mode = own(w, "mode") ?? "none", region = def.region ?? "inside", stat = def.stat ?? "max";
+  const w = canonicalWindow(def.window);
+  const mode = w.mode, region = def.region ?? "inside", stat = def.stat ?? "max";
   const db = def.db ?? "auto";
   if (!MODE_IDS.has(mode)) fail(`Unknown window mode '${mode}'.`);
   if (!REGION_IDS.has(region)) fail(`Unknown region '${region}'.`);
   if (!STAT_IDS.has(stat)) fail(`Unknown statistic '${stat}'.`);
   if (!DB_IDS.has(db)) fail(`Unknown dB mode '${db}'.`);
   if (mode === "none" && region !== "inside") fail("An 'outside' region needs a window.");
-  const ow = region === "outside_within";
-  const num = (k) => {
-    const v = own(w, k);
-    return v == null ? null : (isFin(v) ? v : fail(`Window ${k} must be a finite number.`));
-  };
-  const plan = { kind: "reduce", src, ax, over, n, dims, shape, xkind, xv, mode, region, stat,
+  return { kind: "reduce", src, ax, over, n, dims, shape, xkind, xv, mode, region, stat,
+    ow: region === "outside_within",
+    win: neededFields(mode, region).map((f) => windowField(ds, def, w[f], f, dims, shape)),
     db: db === "yes" || (db === "auto" && isDb(unitsOf(src))) };
-
-  if (mode === "fixed") {
-    const lo = num("lo"), hi = num("hi");
-    if (lo === null || hi === null) fail("A fixed window needs both lo and hi.");
-    plan.lo = Math.min(lo, hi); plan.hi = Math.max(lo, hi);
-    const lo2 = num("lo2"), hi2 = num("hi2");
-    if (ow && (lo2 === null || hi2 === null)) fail("'Within outer span' needs the outer lo and hi.");
-    plan.lo2 = lo2 === null ? -Infinity : Math.min(lo2, hi2 ?? lo2);
-    plan.hi2 = hi2 === null ? Infinity : Math.max(hi2, lo2 ?? hi2);
-  } else if (mode === "relative") {
-    const c = own(w, "center");
-    const cdim = refName(c, "coord:"), cname = refName(c, "var:");
-    if (cdim) {
-      if (!dims.includes(cdim)) fail(`Window center '${cdim}' is not a remaining dimension of the result.`);
-      const cv = numCoord(ds, cdim);
-      plan.ckind = "coord"; plan.cdim = cdim;
-      plan.cv = cv && cv.shape[0] === shape[dims.indexOf(cdim)] ? cv : null;
-    } else if (cname) {
-      const cv = needNumVar(ds, cname, "a window center");
-      for (const d of cv.dims) {
-        if (!dims.includes(d)) fail(`Window center '${cname}' has dimension '${d}', which the result lacks.`);
-        if (dimSize(cv, d) !== shape[dims.indexOf(d)]) fail(`'${d}' has a different size in '${cname}'.`);
-      }
-      plan.ckind = "var"; plan.cv = cv;
-    } else fail("Choose the window center (a coordinate or variable).");
-    const hw = num("halfwidth"), hw2 = num("halfwidth2");
-    if (hw === null) fail("A relative window needs a half width.");
-    if (ow && hw2 === null) fail("'Within outer span' needs the outer half width.");
-    plan.hw = Math.abs(hw); plan.hw2 = hw2 === null ? Infinity : Math.abs(hw2);
-    const k = own(w, "k") ?? 1, off = own(w, "offset") ?? 0;
-    if (!isFin(k) || !isFin(off)) fail("Window k and offset must be finite numbers.");
-    plan.k = k; plan.off = off;
-  } else {
-    plan.lo = -Infinity; plan.hi = Infinity; plan.lo2 = -Infinity; plan.hi2 = Infinity;
-  }
-  return plan;
 }
 
 function resolveCombine(ds, def) {
@@ -434,6 +650,17 @@ function resolveTransform(ds, def) {
   return { kind: "transform", src, fn: def.fn, scale, offset, dims: src.dims.slice(), shape: src.shape.slice() };
 }
 
+function resolveFormula(ds, def) {
+  const text = exprStr(def.expr, FORMULA_MAX);
+  if (!text.trim()) fail("The formula is empty — enter an expression.");
+  try {
+    return { kind: "formula", ...formulaCore(ds, def, text) };
+  } catch (e) {
+    if (e instanceof ExprError) fail(`Formula: ${e.message}`);
+    throw e;
+  }
+}
+
 // error string | null. Structure + references only (deps must be registered);
 // name rules are validateName's job (registerDerived applies both).
 export function validateDef(ds, def) {
@@ -444,10 +671,77 @@ export function resultShape(ds, def) {
   try { const p = resolve(ds, def); return { dims: p.dims, shape: p.shape }; } catch (e) { return null; }
 }
 
+// Live check of ONE expression box: field lo|hi|lo2|hi2|center|halfwidth|
+// halfwidth2 (reduce) or expr (formula). Parse + name resolution + the dims
+// rule (when src/over are usable). Empty: an error only when the field is
+// needed. A field the def's kind/mode does not use -> null. Message|null.
+export function exprError(ds, def, field) {
+  if (!isObj(def)) return null;
+  const kind = def.kind ?? "reduce";
+  try {
+    if (field === "expr") {
+      if (kind !== "formula") return null;
+      const text = exprStr(def.expr, FORMULA_MAX);
+      if (!text.trim()) return "Enter an expression (required).";
+      formulaCore(ds, def, text);
+      return null;
+    }
+    if (kind !== "reduce" || !WIN_FIELDS.includes(field)) return null;
+    const w = canonicalWindow(def.window);
+    if (!hasOwn(MODE_FIELDS, w.mode) || !MODE_FIELDS[w.mode].includes(field)) return null;
+    const text = w[field];
+    if (!text.trim())
+      return neededFields(w.mode, def.region ?? "inside").includes(field) ? "Enter an expression (required)." : null;
+    const ast = parseCached(text);
+    const rd = reduceDims(ds, def);
+    bindNames(ds, ast, def.name, rd && rd.dims, rd && rd.shape);
+    return null;
+  } catch (e) {
+    return e.message;
+  }
+}
+
+// The value of one expression field at result multi-index `fixed` {dim: idx}
+// (missing dims -> 0, clamped): a window field (any of the seven, whatever the
+// mode) over the reduce's result dims, or the formula ("expr", non-finite ->
+// NaN like the stored result). NaN when it cannot be computed.
+export function exprValueAt(ds, def, field, fixed) {
+  if (!isObj(def)) return NaN;
+  try {
+    let ast, binds, dims, shape;
+    if (field === "expr") {
+      if (def.kind !== "formula") return NaN;
+      const text = exprStr(def.expr, FORMULA_MAX);
+      if (!text.trim()) return NaN;
+      ({ ast, binds, dims, shape } = formulaCore(ds, def, text));
+    } else if (WIN_FIELDS.includes(field) && (def.kind ?? "reduce") === "reduce") {
+      const rd = reduceDims(ds, def);
+      const text = canonicalWindow(def.window)[field];
+      if (!rd || !text.trim()) return NaN;
+      ({ dims, shape } = rd);
+      ast = parseCached(text);
+      binds = bindNames(ds, ast, def.name, dims, shape);
+    } else return NaN;
+    if (shape.some((s) => s === 0)) return NaN;
+    const f = isObj(fixed) ? fixed : {};
+    const idx = dims.map((d, r) => Math.max(0, Math.min((Number(own(f, d)) | 0), shape[r] - 1)));
+    const v = evalExpr(ast, lookupAt(binds, dims, idx), 1)[0];
+    return field === "expr" && !Number.isFinite(v) ? NaN : v;
+  } catch (e) {
+    return NaN;
+  }
+}
+
 // ---- units / descriptions ------------------------------------------------------
 export function autoUnits(ds, def) {
   if (!isObj(def)) return "";
   const u = (n) => unitsOf(getVar(ds, n));
+  if (def.kind === "formula") {
+    try {
+      const ast = parseCached(exprStr(def.expr, FORMULA_MAX));
+      return exprUnits(ast, (n) => nameUnits(ds, n));
+    } catch (e) { return ""; }
+  }
   if (def.kind === "combine") {
     const ua = u(def.a), ub = typeof def.b === "string" ? u(def.b) : "";
     switch (def.op) {
@@ -483,9 +777,11 @@ export function effectiveUnits(ds, def) {
   return trimUnits(isObj(def) ? def.units : "") || autoUnits(ds, def);
 }
 
+// one line; expressions are shown verbatim ("?" when empty)
 export function describeDef(def) {
   if (!isObj(def)) return "";
   const nm = (s) => (s === "" || s == null ? "?" : String(s));
+  if (def.kind === "formula") return oneLine(exprStr(def.expr, FORMULA_MAX)) || "?";
   if (def.kind === "combine") {
     const a = nm(def.a), b = typeof def.b === "number" ? fmtG(def.b) : nm(def.b);
     if (def.op === "max" || def.op === "min") return `${def.op}(${a}, ${b})`;
@@ -503,23 +799,15 @@ export function describeDef(def) {
     return t;
   }
   let t = `${label(STATS, def.stat)} of ${nm(def.src)} over ${nm(def.over)}`;
-  const w = isObj(def.window) ? def.window : {};
-  const g = (x) => (isFin(x) ? fmtG(x) : "?");
+  const w = canonicalWindow(def.window);
+  const e = (s) => oneLine(s) || "?";
   let inner = "", outer = "";
-  if (w.mode === "fixed") {
-    const lo = isFin(w.lo) && isFin(w.hi) ? Math.min(w.lo, w.hi) : w.lo;
-    const hi = isFin(w.lo) && isFin(w.hi) ? Math.max(w.lo, w.hi) : w.hi;
-    inner = `[${g(lo)}, ${g(hi)}]`;
-    const lo2 = isFin(w.lo2) && isFin(w.hi2) ? Math.min(w.lo2, w.hi2) : w.lo2;
-    const hi2 = isFin(w.lo2) && isFin(w.hi2) ? Math.max(w.lo2, w.hi2) : w.hi2;
-    outer = `[${g(lo2)}, ${g(hi2)}]`;
-  } else if (w.mode === "relative") {
-    const c = refName(w.center, "coord:") || refName(w.center, "var:") || "?";
-    const k = own(w, "k") ?? 1, off = own(w, "offset") ?? 0;
-    let m = k === 1 ? c : `${g(k)}·${c}`;
-    if (off) m += off < 0 ? ` - ${g(-off)}` : ` + ${g(off)}`;
-    inner = `${m} ± ${isFin(w.halfwidth) ? fmtG(Math.abs(w.halfwidth)) : "?"}`;
-    outer = `${m} ± ${isFin(w.halfwidth2) ? fmtG(Math.abs(w.halfwidth2)) : "?"}`;
+  if (w.mode === "range") {
+    inner = `[${e(w.lo)}, ${e(w.hi)}]`;
+    outer = `[${e(w.lo2)}, ${e(w.hi2)}]`;
+  } else if (w.mode === "center") {
+    inner = `${e(w.center)} ± ${e(w.halfwidth)}`;
+    outer = `${e(w.center)} ± ${e(w.halfwidth2)}`;
   }
   if (inner) {
     if (def.region === "outside") t += `, outside ${inner}`;
@@ -662,8 +950,8 @@ const stridesIn = (v, dims) => {
   return dims.map((d) => { const i = v.dims.indexOf(d); return i < 0 ? 0 : s[i]; });
 };
 
-// arrays + strides for walking a reduce: src, x and center addressed by the
-// result multi-index (strides per result dim) plus a step along `over`
+// arrays + strides for walking a reduce: src and x addressed by the result
+// multi-index (strides per result dim) plus a step along `over`
 function prepareReduce(ds, p) {
   const { src, ax, dims, n } = p;
   const q = { y: f64(src.data), step: stridesOf(src.shape)[ax], sStr: stridesIn(src, dims) };
@@ -675,41 +963,69 @@ function prepareReduce(ds, p) {
     q.x = p.xkind === "coord" ? scaled(p.xv) : iota(n);
     q.xStep = 1; q.xStr = dims.map(() => 0);
   }
-  if (p.mode === "relative") {
-    if (p.ckind === "var") { q.c = scaled(p.cv); q.cStr = stridesIn(p.cv, dims); }
-    else {
-      q.c = p.cv ? scaled(p.cv) : iota(p.shape[dims.indexOf(p.cdim)]);
-      q.cStr = dims.map((d) => (d === p.cdim ? 1 : 0));
-    }
-  } else { q.c = null; q.cStr = dims.map(() => 0); }
   return q;
+}
+
+// The needed window expressions, each evaluated ONCE: over the whole result
+// (idx null; Float64Array(total) per field) or at one result multi-index
+// (Float64Array(1)). Same arithmetic either way.
+function windowValues(p, idx) {
+  const W = {};
+  const n = idx ? 1 : prod(p.shape);
+  for (const f of p.win) {
+    W[f.field] = evalExpr(f.ast, idx ? lookupAt(f.binds, p.dims, idx) : lookupAll(f.binds, p.dims, p.shape), n);
+  }
+  return W;
+}
+
+// Window bounds of result element i into B = [lo, hi, lo2, hi2]. range: lo/hi
+// sorted; center: m ∓ |hw|. Returns false when the window is undefined there:
+// a needed EXPRESSION value is NaN/±Inf (e.g. a NaN center). Finite values
+// whose m ± |hw| overflows give an infinite edge, not an undefined window
+// (as bc9812f's relative windows did).
+function bounds(p, W, i, B) {
+  let lo = -Infinity, hi = Infinity, lo2 = -Infinity, hi2 = Infinity, ok = true;
+  if (p.mode === "range") {
+    const a = W.lo[i], b = W.hi[i];
+    lo = Math.min(a, b); hi = Math.max(a, b);
+    ok = Number.isFinite(a) && Number.isFinite(b);
+    if (p.ow) {
+      const a2 = W.lo2[i], b2 = W.hi2[i];
+      lo2 = Math.min(a2, b2); hi2 = Math.max(a2, b2);
+      ok = ok && Number.isFinite(a2) && Number.isFinite(b2);
+    }
+  } else if (p.mode === "center") {
+    const m = W.center[i], h = W.halfwidth[i], hw = Math.abs(h);
+    lo = m - hw; hi = m + hw;
+    ok = Number.isFinite(m) && Number.isFinite(h);
+    if (p.ow) {
+      const h2 = W.halfwidth2[i], hw2 = Math.abs(h2);
+      lo2 = m - hw2; hi2 = m + hw2;
+      ok = ok && Number.isFinite(h2);
+    }
+  }
+  B[0] = lo; B[1] = hi; B[2] = lo2; B[3] = hi2;
+  return ok;
 }
 
 function computeReduce(ds, p) {
   const q = prepareReduce(ds, p);
-  const { y, step, sStr, x, xStep, xStr, c, cStr } = q;
+  const { y, step, sStr, x, xStep, xStr } = q;
   const nr = p.dims.length, rshape = p.shape, total = prod(rshape), n = p.n;
   const region = REGION_CODE[p.region], stat = STAT_CODE[p.stat], db = p.db;
-  const rel = p.mode === "relative";
+  const W = windowValues(p, null), B = new Float64Array(4);
   const out = new Float64Array(total);
   const idx = new Int32Array(nr);
-  let oS = 0, oX = 0, oC = 0;
-  let lo = p.lo, hi = p.hi, lo2 = p.lo2, hi2 = p.hi2;
+  let oS = 0, oX = 0;
   for (let f = 0; f < total; f++) {
-    let undef = false;
-    if (rel) {
-      const m = p.k * c[oC] + p.off;
-      lo = m - p.hw; hi = m + p.hw; lo2 = m - p.hw2; hi2 = m + p.hw2;
-      undef = !Number.isFinite(m);
-    }
-    // a relative window around a NaN center is undefined: no sample is a
-    // member of ANY region (inside or outside) -> NaN (count 0)
-    out[f] = undef ? (stat === S_COUNT ? 0 : NaN)
-      : kernel(y, oS, step, x, oX, xStep, n, lo, hi, lo2, hi2, region, stat, db);
+    // an undefined window has no members in ANY region (inside or outside)
+    // -> NaN (count 0)
+    out[f] = !bounds(p, W, f, B) ? (stat === S_COUNT ? 0 : NaN)
+      : kernel(y, oS, step, x, oX, xStep, n, B[0], B[1], B[2], B[3], region, stat, db);
     for (let d = nr - 1; d >= 0; d--) {        // odometer over the result dims
-      oS += sStr[d]; oX += xStr[d]; oC += cStr[d];
+      oS += sStr[d]; oX += xStr[d];
       if (++idx[d] < rshape[d]) break;
-      oS -= sStr[d] * rshape[d]; oX -= xStr[d] * rshape[d]; oC -= cStr[d] * rshape[d];
+      oS -= sStr[d] * rshape[d]; oX -= xStr[d] * rshape[d];
       idx[d] = 0;
     }
   }
@@ -764,11 +1080,20 @@ function computeTransform(ds, p) {
   return out;
 }
 
+// the whole formula in one vectorized pass over the result
+function computeFormula(ds, p) {
+  const total = prod(p.shape);
+  const out = evalExpr(p.ast, lookupAll(p.binds, p.dims, p.shape), total);
+  for (let i = 0; i < total; i++) if (!Number.isFinite(out[i])) out[i] = NaN;
+  return out;
+}
+
 // { dims, shape, data: Float64Array, attrs: {units, long_name} }; throws Error(msg)
 export function computeDef(ds, def) {
   const p = resolve(ds, def);
   const data = p.kind === "reduce" ? computeReduce(ds, p)
-    : p.kind === "combine" ? computeCombine(ds, p) : computeTransform(ds, p);
+    : p.kind === "combine" ? computeCombine(ds, p)
+      : p.kind === "formula" ? computeFormula(ds, p) : computeTransform(ds, p);
   const desc = typeof def.description === "string" ? def.description.trim() : "";
   return { dims: p.dims.slice(), shape: p.shape.slice(), data,
     attrs: { units: effectiveUnits(ds, def), long_name: desc || describeDef(def) } };
@@ -795,15 +1120,19 @@ export function registerDerived(ds, defs) {
     if (!isObj(d)) continue;
     const name = typeof d.name === "string" ? d.name : "";
     if (status.has(name) || list.some((e) => e.name === name)) continue;
-    const e = validateName(ds, [], name);
+    const e = validateName(ds, [], name, name);     // (a function-named old def is kept)
     if (e) { bad(name, e); continue; }
     list.push(d);
   }
   const { order, errors } = topoOrder(list);
   for (const [n, msg] of errors) bad(n, msg);
   for (const d of order) {
-    // a dep that is a failed def (and not a real variable) fails this one too
-    const dep = depsOf(d).find((n) => !getVar(ds, n) && status.has(n) && !status.get(n).ok);
+    // a dep that is a failed def fails this one too — unless the name means
+    // something else here (a real variable, a dimension). A failed def named
+    // pi does fail its dependents (as in bc9812f and the Python script): the
+    // reference meant that def, not the constant.
+    const dep = depsOf(d).find((n) => !getVar(ds, n) && !hasOwn(ds.dims, n)
+      && status.has(n) && !status.get(n).ok);
     if (dep) { bad(d.name, `depends on '${dep}', which has an error`); continue; }
     try {
       const r = computeDef(ds, d);
@@ -816,6 +1145,30 @@ export function registerDerived(ds, defs) {
     } catch (e) { bad(d.name, e.message); }
   }
   return status;
+}
+
+// Rename every reference to oldName in `def` (mutated; also returned): src, a,
+// b, an x source var:<old>, the window expressions and the formula. `over` is a
+// dimension and never renamed. A legacy window is migrated first.
+export function renameRef(def, oldName, newName) {
+  if (!isObj(def) || typeof oldName !== "string" || !oldName || typeof newName !== "string"
+    || oldName === newName) return def;
+  const kind = def.kind ?? "reduce";
+  if ((kind === "reduce" || kind === "transform") && def.src === oldName) def.src = newName;
+  if (kind === "combine") {
+    if (def.a === oldName) def.a = newName;
+    if (def.b === oldName) def.b = newName;
+  }
+  if (kind === "formula" && typeof def.expr === "string") def.expr = renameInExpr(def.expr, oldName, newName);
+  if (kind === "reduce") {
+    if (def.xsrc === "var:" + oldName) def.xsrc = "var:" + newName;
+    if (isObj(def.window)) {
+      const w = isLegacyWindow(def.window) ? migrateWindow(def.window) : def.window;
+      for (const f of WIN_FIELDS) if (typeof w[f] === "string") w[f] = renameInExpr(w[f], oldName, newName);
+      def.window = w;
+    }
+  }
+  return def;
 }
 
 // ---- builder helpers -------------------------------------------------------------
@@ -854,9 +1207,9 @@ export function suggestXsrc(ds, src, over) {
   return cv ? "coord" : "index";
 }
 
-// window-center sources: each remaining dim's coordinate (index if it has
+// (bc9812f window-center sources; kept for compatibility — the expression
+// builder uses windowNames) each remaining dim's coordinate (index if it has
 // none) and every numeric var whose dims are a subset of the result dims
-// (a dim's own coordinate variable is listed once, as coord:<dim>)
 export function centerSourceOptions(ds, src, over) {
   const v = getVar(ds, src);
   if (!v) return [];
@@ -869,42 +1222,86 @@ export function centerSourceOptions(ds, src, over) {
   return out;
 }
 
+// name-picker entries: {name, dims, units, isDim, label}; isDim = the name is a
+// dimension without a numeric coordinate variable (it stands for the index)
+const varEntry = (n, v) => {
+  const units = unitsOf(v);
+  return { name: n, dims: v.dims.slice(), units, isDim: false, label: units ? `${n} [${units}]` : n };
+};
+const dimEntry = (d) => ({ name: d, dims: [d], units: "", isDim: true, label: `${d} [index]` });
+
+// names usable in the window expressions of a reduce of `src` over `over`: the
+// remaining dims (as their numeric coordinate variable when there is one, else
+// the index) first, then every numeric var whose dims are remaining dims
+export function windowNames(ds, src, over) {
+  const v = getVar(ds, src);
+  if (!ds || !isNumVar(v) || !v.dims.includes(over)) return [];
+  const rd = reduceDims(ds, { src, over });
+  if (!rd) return [];
+  const usable = (cv) => cv.dims.every((d) => {
+    const j = rd.dims.indexOf(d);
+    return j >= 0 && dimSize(cv, d) === rd.shape[j];
+  });
+  const out = [], seen = new Set();
+  for (const d of rd.dims) {
+    seen.add(d);
+    const cv = numCoord(ds, d);              // a dim name = its coordinate, else its index
+    if (cv) { if (usable(cv)) out.push(varEntry(d, cv)); }
+    else out.push(dimEntry(d));
+  }
+  for (const [n, cv] of Object.entries(ds.vars)) {
+    if (seen.has(n) || n === src || !isNumVar(cv) || hasOwn(ds.dims, n)) continue;
+    if (usable(cv)) out.push(varEntry(n, cv));
+  }
+  return out;
+}
+
+// names usable in a formula: every numeric variable (file order) — except one
+// named like a dimension that is not its coordinate (the name means the index)
+// — then every dimension without a numeric coordinate variable
+export function formulaNames(ds) {
+  if (!ds || !ds.vars) return [];
+  const out = [];
+  for (const [n, v] of Object.entries(ds.vars)) {
+    if (isNumVar(v) && (!hasOwn(ds.dims, n) || numCoord(ds, n))) out.push(varEntry(n, v));
+  }
+  for (const d of Object.keys(ds.dims || {})) if (!numCoord(ds, d)) out.push(dimEntry(d));
+  return out;
+}
+
 // Builder preview of one reduce line at result multi-index `fixed` {dim: idx}
 // (missing dims -> 0, clamped). member = region membership by x (whether or not
 // y is finite); inner/outer = the window bounds actually used (outer only for
-// outside_within); center = the window center k·c + offset (relative mode).
+// outside_within; both null when the window is undefined there); center = the
+// evaluated center expression (center mode) or null.
 export function previewSlice(ds, def, fixed) {
   const p = resolve(ds, def);
   if (p.kind !== "reduce") throw new Error("Preview is only available for window statistics.");
   if (p.shape.some((s) => s === 0)) throw new Error("The result has a dimension of size 0.");
   const q = prepareReduce(ds, p);
   const f = isObj(fixed) ? fixed : {};
-  let oS = 0, oX = 0, oC = 0;
-  p.dims.forEach((d, r) => {
-    const i = Math.max(0, Math.min((Number(own(f, d)) | 0), p.shape[r] - 1));
-    oS += i * q.sStr[r]; oX += i * q.xStr[r]; oC += i * q.cStr[r];
-  });
-  let { lo, hi, lo2, hi2 } = p, center = null;
-  if (p.mode === "relative") {
-    center = p.k * q.c[oC] + p.off;
-    lo = center - p.hw; hi = center + p.hw; lo2 = center - p.hw2; hi2 = center + p.hw2;
-  }
+  const idx = p.dims.map((d, r) => Math.max(0, Math.min((Number(own(f, d)) | 0), p.shape[r] - 1)));
+  let oS = 0, oX = 0;
+  idx.forEach((i, r) => { oS += i * q.sStr[r]; oX += i * q.xStr[r]; });
+  const W = windowValues(p, idx), B = new Float64Array(4);
+  const ok = bounds(p, W, 0, B);
+  const [lo, hi, lo2, hi2] = B;
+  const center = p.mode === "center" ? W.center[0] : null;
   const n = p.n, region = REGION_CODE[p.region];
-  const undef = center !== null && !Number.isFinite(center);    // NaN center: nothing is a member
   const x = new Float64Array(n), y = new Float64Array(n), member = new Uint8Array(n);
   for (let k = 0; k < n; k++) {
     x[k] = q.x[oX + k * q.xStep];
     y[k] = q.y[oS + k * q.step];
-    member[k] = !undef && isMember(x[k], region, lo, hi, lo2, hi2) ? 1 : 0;
+    member[k] = ok && isMember(x[k], region, lo, hi, lo2, hi2) ? 1 : 0;
   }
   const args = [q.y, oS, q.step, q.x, oX, q.xStep, n, lo, hi, lo2, hi2, region];
   return {
     x, y, member,
-    inner: p.mode === "none" || undef ? null : [lo, hi],
-    outer: p.mode !== "none" && !undef && p.region === "outside_within" ? [lo2, hi2] : null,
+    inner: p.mode === "none" || !ok ? null : [lo, hi],
+    outer: p.mode !== "none" && ok && p.ow ? [lo2, hi2] : null,
     center,
-    value: undef ? (p.stat === "count" ? 0 : NaN) : kernel(...args, STAT_CODE[p.stat], p.db),
-    count: undef ? 0 : kernel(...args, S_COUNT, false),
+    value: !ok ? (p.stat === "count" ? 0 : NaN) : kernel(...args, STAT_CODE[p.stat], p.db),
+    count: !ok ? 0 : kernel(...args, S_COUNT, false),
     db: p.db,
   };
 }

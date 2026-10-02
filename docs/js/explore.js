@@ -38,9 +38,10 @@ export function scaledLabel(base, prefix) {
   return base ? `${base} (×1e${exp})` : `×1e${exp}`;
 }
 
-// datetime/timedelta-ish coords/vars -> seconds; numbers pass through
+// datetime/timedelta-ish coords/vars -> seconds; numbers pass through. Units
+// are trimmed first (' minutes' is minutes), like the Python report script.
 export function asFloatArray(arr, unitsAttr) {
-  const u = String(unitsAttr || "").toLowerCase();
+  const u = String(unitsAttr || "").trim().toLowerCase();
   let scale = 1;
   if (/^nanoseconds\b|\bns\b/.test(u)) scale = 1e-9;
   else if (/^microseconds\b/.test(u)) scale = 1e-6;

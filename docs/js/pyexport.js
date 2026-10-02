@@ -7,6 +7,13 @@
 //   buildReportScript(project, opts) -> the full text of the .py file
 //   reportFileName(stamp)            -> "ncx_report_<stamp>.py"
 //   neededDerived(project, tabIdx)   -> canonical derived defs the tabs need (transitively)
+//   exprRefs(text)                   -> names an expression mentions (tolerant scan)
+//   migrateWindow(w)                 -> a reduce window in the expression format
+//                                       (legacy "fixed"/"relative" windows converted)
+//
+// Window bounds and "formula" defs are EXPRESSIONS (SPEC_EXPR E1); the Python
+// script carries its own parser/evaluator (section 1e of the template), so this
+// module only needs the names an expression refers to (for the dependencies).
 //
 // The Python side is ONE readable template (PY_TEMPLATE below, a String.raw
 // literal so backslashes reach Python untouched; it must never contain a
@@ -30,10 +37,10 @@ export function reportFileName(stamp) {
 
 // The derived defs the selected tabs need: every def referenced by a trace's
 // variable, x source (var:) or sweep-value source (var:), plus — transitively —
-// the defs those depend on (src / a / b / x source / window center).
-// Returned canonical (see reportDef), in project order.
+// the defs those depend on (src / a / b / x source / names used in the window
+// expressions or the formula). Returned canonical (see reportDef), in project order.
 export function neededDerived(project, tabIdx) {
-  const defs = projectDefs(project);
+  const defs = projectDefs(project).map(reportDef).filter(Boolean);
   const tabs = projectTabs(project);
   const sel = selectTabs(tabs.length, tabIdx);
   const key = (file, name) => baseName(file).toLowerCase() + "\u0000" + name;
@@ -60,8 +67,88 @@ export function neededDerived(project, tabIdx) {
     const d = stack.pop();
     for (const dep of defDeps(d)) visit(d.file, dep);
   }
-  return defs.filter((d) => { const k = key(d.file, d.name); return want.has(k) && byKey.get(k) === d; })
-    .map(reportDef).filter(Boolean);
+  return defs.filter((d) => { const k = key(d.file, d.name); return want.has(k) && byKey.get(k) === d; });
+}
+
+// Names an expression mentions, first appearance first: identifiers and
+// "quoted names", minus numbers (incl. SI suffix) and function-call names (an
+// identifier followed by "("). A tolerant scan, not a parse — a half-typed or
+// invalid expression still yields its names, which is all the dependency
+// order needs. The Python script's expr_refs() is the same scan.
+// (In a quoted name a '"' directly followed by a letter, digit or _ belongs to
+// the name, as in expr.js.)
+const REF_TOKEN = /"((?:[^"]|"(?=[A-Za-z0-9_]))*)"?|(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?[pnumkKMGT\u00b5\u03bc]?|([A-Za-z_][A-Za-z0-9_]*)([ \t\r\n]*\()?/g;
+export function exprRefs(text) {
+  const out = [];
+  if (typeof text !== "string") return out;
+  for (const m of text.matchAll(REF_TOKEN)) {
+    const n = m[1] !== undefined ? m[1] : (m[2] !== undefined && m[3] === undefined ? m[2] : "");
+    if (n && !out.includes(n)) out.push(n);
+  }
+  return out;
+}
+
+// ---- reduce windows (SPEC_EXPR E2/E3) --------------------------------------
+const WINDOW_FIELDS = ["lo", "hi", "lo2", "hi2", "center", "halfwidth", "halfwidth2"];
+const EXPR_FUNCTIONS = ["abs", "sqrt", "exp", "ln", "log", "log10", "floor", "ceil", "round",
+  "db2lin", "lin2db", "pow", "min", "max"];
+const MAX_WINDOW_EXPR = 320, MAX_FORMULA_EXPR = 1000;     // = derive.js EXPR_MAX / FORMULA_MAX
+const isFiniteNum = (v) => typeof v === "number" && Number.isFinite(v);
+const num = (x) => String(x);           // shortest round-trip text: 1000000, 0.02, 1e-7, 1e+21
+// a name as written in an expression: quoted unless a plain identifier that is
+// not a function name / pi
+function quoteName(n) {
+  return /^[A-Za-z_][A-Za-z0-9_]*$/.test(n) && !EXPR_FUNCTIONS.includes(n) && n !== "pi" ? n : `"${n}"`;
+}
+// an expression field: strings (capped) as they are, finite numbers -> num(x), else ""
+const exprField = (v, max = MAX_WINDOW_EXPR) => (typeof v === "string" ? v.slice(0, max) : isFiniteNum(v) ? num(v) : "");
+
+// A window in the expression format {mode, lo, hi, lo2, hi2, center, halfwidth,
+// halfwidth2} (all strings). Windows saved before expressions existed are
+// converted so they compute exactly the same numbers: mode "fixed" -> "range"
+// (numbers -> their text), "relative" -> "center" with center
+// "k*name + offset" (k = 1 and offset = 0 left out), half widths |hw|; in an
+// old window only numbers count (anything else -> ""). Which windows are old:
+// the rule of derive.js (isLegacyWindow) — mode fixed / relative; or mode
+// none / missing with a k or offset key, a number in a field, or a
+// "coord:"/"var:" center and no other expression text. A "range" / "center"
+// window is never converted ("var:x" stays as typed and is an error there too).
+// Unknown modes are kept (the script reports them).
+export function migrateWindow(raw) {
+  const w = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+  const get = (k) => (own(w, k) ? w[k] : undefined);
+  const rawMode = get("mode");
+  const center = get("center");
+  let legacy = rawMode === "fixed" || rawMode === "relative";
+  if (!legacy && rawMode !== "range" && rawMode !== "center") {
+    legacy = own(w, "k") || own(w, "offset") || WINDOW_FIELDS.some((k) => typeof get(k) === "number")
+      || (typeof center === "string" && /^(coord|var):/.test(center)
+        && WINDOW_FIELDS.every((k) => k === "center" || typeof get(k) !== "string" || get(k) === ""));
+  }
+  const mode = str(rawMode, "none") || "none";
+  const out = { mode, lo: "", hi: "", lo2: "", hi2: "", center: "", halfwidth: "", halfwidth2: "" };
+  if (!legacy) {
+    for (const k of WINDOW_FIELDS) out[k] = exprField(get(k));
+    return out;
+  }
+  const fin = (v) => (isFiniteNum(v) ? num(v) : "");
+  if (mode === "fixed") {
+    out.mode = "range";
+    for (const k of ["lo", "hi", "lo2", "hi2"]) out[k] = fin(get(k));
+  } else if (mode === "relative") {
+    out.mode = "center";
+    const m = typeof center === "string" ? /^(coord|var):/.exec(center) : null;
+    const name = m ? center.slice(m[0].length, m[0].length + 256) : "";     // bc9812f's name cap
+    if (name) {
+      const k = isFiniteNum(get("k")) ? get("k") : 1, off = isFiniteNum(get("offset")) ? get("offset") : 0;
+      const q = quoteName(name);
+      // never cut: at most 311 characters (< MAX_WINDOW_EXPR)
+      out.center = (k === 1 ? q : `${num(k)}*${q}`)
+        + (off === 0 ? "" : off < 0 ? ` - ${num(-off)}` : ` + ${num(off)}`);
+    }
+    for (const k of ["halfwidth", "halfwidth2"]) out[k] = isFiniteNum(get(k)) ? num(Math.abs(get(k))) : "";
+  }
+  return out;          // "none" (and unknown modes): every field ""
 }
 
 // opts = { tabs: [indices into project.tabs] (default all), pdfName, generatedAt, source }
@@ -237,7 +324,7 @@ function projectTabs(project) {
 function projectDefs(project) {
   const d = project && Array.isArray(project.derived) ? project.derived : [];
   return d.filter((x) => x && typeof x === "object" && typeof x.name === "string" && x.name
-    && ["reduce", "combine", "transform"].includes(x.kind));
+    && ["reduce", "combine", "transform", "formula"].includes(x.kind));
 }
 
 // sorted, de-duplicated valid indices; anything but an array -> all tabs
@@ -309,42 +396,47 @@ function cfgTab(raw, i) {
   return { index: i, name: tabName(raw.name, i), plot: cfgPlot(raw.plot || raw.plotcfg), traces, markers };
 }
 
-// var names a def reads (other defs of the same file may be among them)
+// the window fields a reduce actually uses (as derive.js): the inner window
+// always (mode != none), the outer span only for region "outside_within"
+function neededWindowFields(mode, region) {
+  const inner = { range: ["lo", "hi"], center: ["center", "halfwidth"] }[mode];
+  if (!inner) return [];
+  return region === "outside_within" ? inner.concat(mode === "range" ? ["lo2", "hi2"] : ["halfwidth2"]) : inner;
+}
+
+// var names a canonical (reportDef) def reads — other defs of the same file may
+// be among them. Only the window fields in use count (like derive.js's depsOf).
 function defDeps(d) {
   const out = [];
   const add = (n) => { if (typeof n === "string" && n && !out.includes(n)) out.push(n); };
   if (d.kind === "reduce") {
     add(d.src);
     add(varRef(d.xsrc));
-    if (d.window && typeof d.window === "object") add(varRef(d.window.center));
+    for (const k of neededWindowFields(d.window.mode, d.region)) exprRefs(d.window[k]).forEach(add);
   } else if (d.kind === "combine") {
     add(d.a);
     if (typeof d.b === "string") add(d.b);
   } else if (d.kind === "transform") add(d.src);
+  else if (d.kind === "formula") exprRefs(d.expr).forEach(add);
   return out;
 }
 
-// canonical key order (frozen spec §1.1); missing fields -> defaults. Values of
-// the wrong kind for an enumerated field are kept verbatim so the script
-// reports a clear error for that def instead of silently changing its meaning.
+// canonical key order (SPEC.md §1.1 + SPEC_EXPR E2); missing fields ->
+// defaults; legacy windows migrated. Values of the wrong kind for an enumerated
+// field are kept verbatim so the script reports a clear error for that def
+// instead of silently changing its meaning.
 const str = (v, d = "") => (v == null ? d : String(v));
-const numOrNull = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
 function reportDef(d) {
   if (!d || typeof d !== "object") return null;
   const head = { name: str(d.name), file: baseName(d.file), kind: d.kind, units: str(d.units), description: str(d.description) };
   if (d.kind === "reduce") {
-    const w = d.window && typeof d.window === "object" ? d.window : {};
     return {
       ...head, src: str(d.src), over: str(d.over), xsrc: str(d.xsrc, "index") || "index",
-      window: {
-        mode: str(w.mode, "none") || "none",
-        lo: numOrNull(w.lo), hi: numOrNull(w.hi), lo2: numOrNull(w.lo2), hi2: numOrNull(w.hi2),
-        center: str(w.center), k: finiteOr(w.k, 1), offset: finiteOr(w.offset, 0),
-        halfwidth: numOrNull(w.halfwidth), halfwidth2: numOrNull(w.halfwidth2),
-      },
+      window: migrateWindow(d.window),
       region: str(d.region, "inside") || "inside", stat: str(d.stat, "max") || "max", db: str(d.db, "auto") || "auto",
     };
   }
+  if (d.kind === "formula") return { ...head, expr: exprField(d.expr, MAX_FORMULA_EXPR) };
   if (d.kind === "combine") {
     const b = typeof d.b === "number" ? d.b : str(d.b);
     return { ...head, a: str(d.a), op: str(d.op, "-") || "-", b };
@@ -564,9 +656,20 @@ def tex_safe(s):
     return s if ALLOW_MATHTEXT else s.replace("$", r"\$")
 
 
+# the characters JavaScript's trim() removes (the web app trims units with it;
+# Python's strip() would also remove \x1c-\x1f and \x85 but keep the BOM)
+_JS_SPACE = (" \t\n\x0b\x0c\r\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006"
+             "\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
+
+
+def js_trim(s):
+    """s without leading/trailing white space, exactly like the web app."""
+    return (s or "").strip(_JS_SPACE)
+
+
 def is_db(units):
     """dB-like units (dB, dBm, DBM, dBc ...): averaged in linear power."""
-    return "db" in (units or "").strip().lower()
+    return "db" in js_trim(units).lower()
 
 
 _TIME_UNITS = ((r"^nanoseconds\b|\bns\b", 1e-9), (r"^microseconds\b", 1e-6),
@@ -576,7 +679,7 @@ _TIME_UNITS = ((r"^nanoseconds\b|\bns\b", 1e-9), (r"^microseconds\b", 1e-6),
 
 def time_scale(units):
     """Factor that converts time-like units to SECONDS (1.0 for anything else)."""
-    u = (units or "").lower()
+    u = js_trim(units).lower()
     for pattern, factor in _TIME_UNITS:
         if re.search(pattern, u, re.ASCII):
             return factor
@@ -612,55 +715,105 @@ def _attr_str(value):
         return ""
     if isinstance(value, bytes):
         value = value.decode("utf-8", "replace")
-    return str(value).strip()     # e.g. units 'DBM\n' -> 'DBM'
+    return js_trim(str(value))     # e.g. units 'DBM\n' -> 'DBM'
 
 
 def open_netcdf(path):
-    """Open a NetCDF file with xarray: fill values -> NaN (CF masking on), times
-    NOT decoded (kept as numbers). Tries the available readers in turn."""
+    """Open a NetCDF file with xarray: fill values -> NaN and packed data
+    unpacked (CF mask_and_scale on), times NOT decoded (kept as numbers), char
+    arrays NOT joined into strings (so a dimension used only by them, e.g.
+    'nchar', stays a dimension as in the app). Tries the available readers in
+    turn, and simpler options for very old xarray versions."""
     problems = []
     for extra in ({}, {"engine": "h5netcdf"}, {"engine": "netcdf4"}, {"engine": "scipy"}):
-        kw = dict(decode_times=False, decode_timedelta=False, **extra)
-        try:
-            return xr.open_dataset(path, **kw)
-        except TypeError:  # very old xarray: no decode_timedelta
-            kw.pop("decode_timedelta")
+        last = None
+        for opts in ({"decode_timedelta": False, "concat_characters": False},
+                     {"decode_timedelta": False}, {}):
+            kw = dict(decode_times=False, **opts)
+            kw.update(extra)
             try:
                 return xr.open_dataset(path, **kw)
             except Exception as e:
-                problems.append("%s: %s" % (extra.get("engine", "auto"), e))
-        except Exception as e:
-            problems.append("%s: %s" % (extra.get("engine", "auto"), e))
+                last = e
+        problems.append("%s: %s" % (extra.get("engine", "auto"), last))
     raise IOError("cannot open %s (%s). NetCDF-3 files need scipy, NetCDF-4/HDF5 files "
                   "need h5netcdf or netCDF4." % (path, "; ".join(problems)))
 
 
+def _is_netcdf3(path):
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(3) == b"CDF"
+    except OSError:
+        return False
+
+
+def _utf8_name(s):
+    """NetCDF-3 names are UTF-8 (netCDF-C and the web app read them so), but
+    scipy's reader decodes them as latin-1: 'pwr \u00c2\u00b5W' -> 'pwr \u00b5W'."""
+    try:
+        return s.encode("latin-1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return s
+
+
+def _near_fill(data, v):
+    """The web app also treats values within 1e-5 (relative) of a HUGE fill value
+    (|fill| > 1e30, e.g. 9.96921e36) as missing; xarray masks exact matches only.
+    (Packed variables: exact matches only.)"""
+    enc = getattr(v, "encoding", None) or {}
+    if "scale_factor" in enc or "add_offset" in enc:
+        return data
+    fills = []
+    for src in (enc, v.attrs):
+        for key in ("_FillValue", "missing_value"):
+            if key in src:
+                for x in np.ravel(np.asarray(src[key])).tolist():
+                    try:
+                        x = float(x)
+                    except (TypeError, ValueError):
+                        continue
+                    if math.isfinite(x) and abs(x) > 1e30:
+                        fills.append(x)
+    if not fills:
+        return data
+    with np.errstate(all="ignore"):
+        bad = np.zeros(data.shape, dtype=bool)
+        for fv in fills:
+            bad |= np.abs(data - fv) <= abs(fv) * 1e-5
+    return np.where(bad, np.nan, data) if bad.any() else data
+
+
 class DataFile(object):
     """An opened data file. var(name) returns a Var (real variables are read on
-    first use); derived variables are added with add_derived()."""
+    first use); derived variables are added with add_derived(). Names are the
+    ones the app shows (UTF-8 decoded)."""
 
     def __init__(self, name, path):
         self.name = name
         self.path = path
         self.ds = open_netcdf(path)
+        fix = _utf8_name if _is_netcdf3(path) else str
         sizes = getattr(self.ds, "sizes", None) or self.ds.dims
-        self.sizes = dict((str(k), int(v)) for k, v in sizes.items())
+        self._dim_names = dict((str(k), fix(str(k))) for k in sizes)
+        self.sizes = dict((fix(str(k)), int(v)) for k, v in sizes.items())
+        self._names = dict((fix(str(k)), k) for k in self.ds.variables)   # shown name -> xarray's
         self._vars = {}
 
     def var(self, name):
         if name in self._vars:
             return self._vars[name]
-        if not isinstance(name, str) or name not in self.ds.variables:
+        if not isinstance(name, str) or name not in self._names:
             return None
-        v = self.ds.variables[name]
+        v = self.ds.variables[self._names[name]]
         numeric = v.dtype.kind in "biuf"
-        data = np.asarray(v.values, dtype=float) if numeric else None
-        self._vars[name] = Var(name, [str(d) for d in v.dims], data,
+        data = _near_fill(np.asarray(v.values, dtype=float), v) if numeric else None
+        self._vars[name] = Var(name, [self._dim_names.get(str(d), str(d)) for d in v.dims], data,
                                _attr_str(v.attrs.get("units")), numeric)
         return self._vars[name]
 
     def is_real(self, name):
-        return name in self.ds.variables
+        return name in self._names
 
     def add_derived(self, var):
         self._vars[var.name] = var
@@ -711,13 +864,527 @@ def _along(values, dim, dims, shape):
     return np.broadcast_to(np.reshape(values, sh), shape)
 
 
-# ---- 1e. Derived quantities ------------------------------------------------------
+# ---- 1e. Expressions ----------------------------------------------------------------
+# Window bounds and "formula" quantities are small math expressions over the
+# variables and dimensions of ONE data file (the syntax is explained in the
+# CONFIG section below). parse_expr() reads the text into a tree of Node
+# objects (a syntax error says where it is), eval_on() computes the tree with
+# numpy, broadcasting variables BY DIMENSION NAME, and expr_units() works out
+# the units of the result. The arithmetic is plain IEEE double, evaluated
+# exactly as written (nothing reordered), so the numbers are the web app's.
+
+class ExprError(Exception):
+    """A problem in an expression; pos = its 0-based character position (-1: none),
+    counted like the web app does (a character outside the BMP, e.g. an emoji,
+    counts 2)."""
+
+    def __init__(self, message, pos=-1):
+        Exception.__init__(self, message)
+        self.pos = pos
+
+
+# number suffixes: 300k = 300000, 2.5M = 2.5e6, 10u = 1e-5 (both micro signs = u)
+SI_SUFFIX = {"p": 1e-12, "n": 1e-9, "u": 1e-6, "\u00b5": 1e-6, "\u03bc": 1e-6, "m": 1e-3,
+             "k": 1e3, "K": 1e3, "M": 1e6, "G": 1e9, "T": 1e12}
+# the functions: name -> (fewest, most arguments; None = no limit)
+FUNCTIONS = {"abs": (1, 1), "sqrt": (1, 1), "exp": (1, 1), "ln": (1, 1), "log": (1, 1),
+             "log10": (1, 1), "floor": (1, 1), "ceil": (1, 1), "round": (1, 1),
+             "db2lin": (1, 1), "lin2db": (1, 1), "pow": (2, 2), "min": (1, None), "max": (1, None)}
+
+_SPACE = " \t\r\n"
+_NUMBER = re.compile(r"([0-9]+\.?[0-9]*|\.[0-9]+)([eE][+-]?[0-9]+)?")
+_IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_ID_CHAR = re.compile(r"[A-Za-z0-9_]")
+_GLUED = re.compile(r"[A-Za-z0-9_.\u00b5\u03bc]*")   # text that may not touch a number
+MAX_DEPTH = 64   # nesting limit: parentheses, signs, ^ and function calls (as in the app)
+
+
+def tokenize(text):
+    """The tokens of an expression, as (kind, value, position, text): kind "num"
+    (value = the number, SI suffix applied), "name", "qname" (a "quoted name"),
+    "op" (+ - * / ^ ( ) , - and ** is read as ^), and a final "end"."""
+    tokens, i, n = [], 0, len(text)
+    if any(ord(c) > 0xFFFF for c in text):   # positions as the app counts them
+        at, u = [], 0
+        for c in text:
+            at.append(u)
+            u += 2 if ord(c) > 0xFFFF else 1
+        at.append(u)
+    else:
+        at = range(n + 1)
+    while i < n:
+        c = text[i]
+        if c in _SPACE:
+            i += 1
+            continue
+        m = _NUMBER.match(text, i)
+        if m:
+            value, j = float(m.group(0)), m.end()
+            if j < n and text[j] in SI_SUFFIX:
+                value *= SI_SUFFIX[text[j]]   # ONE multiplication, as in the app
+                j += 1
+            k = _GLUED.match(text, j).end()
+            if k > j:                         # 5ms, 2e, 1.2.3, 3x ...
+                raise ExprError("invalid number '%s'" % text[i:k], at[i])
+            tokens.append(("num", value, at[i], text[i:j]))
+            i = j
+            continue
+        m = _IDENT.match(text, i)
+        if m:
+            tokens.append(("name", m.group(0), at[i], m.group(0)))
+            i = m.end()
+            continue
+        if c == '"':
+            # the name ends at the first " NOT directly followed by a letter, digit
+            # or _ (such a quote belongs to the name: "a"b" is the name a"b)
+            j = text.find('"', i + 1)
+            while j >= 0 and j + 1 < n and _ID_CHAR.match(text, j + 1):
+                j = text.find('"', j + 1)
+            if j < 0:
+                raise ExprError('the quoted name has no closing "', at[i])
+            if j == i + 1:
+                raise ExprError('empty quoted name ""', at[i])
+            tokens.append(("qname", text[i + 1:j], at[i], text[i:j + 1]))
+            i = j + 1
+            continue
+        if text.startswith("**", i):
+            tokens.append(("op", "^", at[i], "**"))
+            i += 2
+            continue
+        if c in "+-*/^(),":
+            tokens.append(("op", c, at[i], c))
+            i += 1
+            continue
+        raise ExprError("unexpected character '%s'" % c, at[i])
+    tokens.append(("end", None, at[n], ""))
+    return tokens
+
+
+class Node(object):
+    """One node of a parsed expression. kind "num": value = the number; "name":
+    value = a variable / dimension name; "neg" / "plus": unary minus / plus of
+    args[0]; "op": value = "+", "-", "*", "/" or "^", args = [left, right];
+    "call": value = the function name, args = its arguments. pos = where the
+    node starts in the text."""
+    __slots__ = ("kind", "value", "args", "pos")
+
+    def __init__(self, kind, value=None, args=(), pos=-1):
+        self.kind, self.value, self.args, self.pos = kind, value, list(args), pos
+
+    def __repr__(self):
+        if self.kind in ("num", "name"):
+            return "%s(%r)" % (self.kind, self.value)
+        return "%s(%s)" % (self.value or self.kind, ", ".join(repr(a) for a in self.args))
+
+
+class _Parser(object):
+    """Recursive descent over the grammar, lowest precedence first:
+        expr  := term (("+" | "-") term)*
+        term  := unary (("*" | "/") unary)*
+        unary := ("-" | "+") unary | power        so -a^2 = -(a^2)
+        power := atom ("^" unary)?                 so a^b^c = a^(b^c); 2^-x works
+        atom  := number | name "(" args ")" | name | "(" expr ")"
+    A name directly followed by "(" is a function call; a "quoted name" never is.
+    At most MAX_DEPTH nested parentheses / signs / ^ / calls."""
+
+    def __init__(self, text):
+        self.tokens = tokenize(text)
+        self.k = 0
+        self.depth = 0
+
+    def enter(self, pos):
+        self.depth += 1
+        if self.depth > MAX_DEPTH:
+            raise ExprError("expression is nested too deeply", pos)
+
+    def peek(self):
+        return self.tokens[self.k]
+
+    def take(self):
+        tok = self.tokens[self.k]
+        self.k += 1
+        return tok
+
+    def at(self, *ops):
+        tok = self.tokens[self.k]
+        return tok[0] == "op" and tok[1] in ops
+
+    def unexpected(self, tok):
+        if tok[0] == "end":
+            return ExprError("unexpected end of the expression", tok[2])
+        return ExprError("unexpected '%s'" % tok[3], tok[2])
+
+    def expect(self, op):
+        if not self.at(op):
+            tok = self.peek()
+            if tok[0] == "end":
+                raise ExprError("missing '%s'" % op, tok[2])
+            raise ExprError("expected '%s' but found '%s'" % (op, tok[3]), tok[2])
+        self.take()
+
+    def expr(self):
+        node = self.term()
+        while self.at("+", "-"):
+            tok = self.take()
+            node = Node("op", tok[1], [node, self.term()], tok[2])
+        return node
+
+    def term(self):
+        node = self.unary()
+        while self.at("*", "/"):
+            tok = self.take()
+            node = Node("op", tok[1], [node, self.unary()], tok[2])
+        return node
+
+    def unary(self):
+        if self.at("-", "+"):
+            tok = self.take()
+            self.enter(tok[2])
+            node = Node("neg" if tok[1] == "-" else "plus", None, [self.unary()], tok[2])
+            self.depth -= 1
+            return node
+        return self.power()
+
+    def power(self):
+        node = self.atom()
+        if self.at("^"):
+            tok = self.take()
+            self.enter(tok[2])
+            node = Node("op", "^", [node, self.unary()], tok[2])
+            self.depth -= 1
+        return node
+
+    def atom(self):
+        tok = self.take()
+        kind, value, pos = tok[0], tok[1], tok[2]
+        if kind == "num":
+            return Node("num", value, (), pos)
+        if kind == "name" and self.at("("):
+            return self.call(value, pos)
+        if kind in ("name", "qname"):
+            return Node("name", value, (), pos)
+        if kind == "op" and value == "(":
+            self.enter(pos)
+            node = self.expr()
+            self.expect(")")
+            self.depth -= 1
+            return node
+        raise self.unexpected(tok)
+
+    def call(self, name, pos):
+        if name not in FUNCTIONS:
+            raise ExprError("unknown function '%s'" % name, pos)
+        self.take()  # "("
+        self.enter(pos)
+        args = []
+        if not self.at(")"):
+            args.append(self.expr())
+            while self.at(","):
+                self.take()
+                args.append(self.expr())
+        self.expect(")")
+        self.depth -= 1
+        fewest, most = FUNCTIONS[name]
+        if len(args) < fewest or (most is not None and len(args) > most):
+            need = ("%d" % fewest) if fewest == most else ("at least %d" % fewest)
+            raise ExprError("%s() takes %s argument%s (%d given)"
+                            % (name, need, "" if fewest == 1 else "s", len(args)), pos)
+        return Node("call", name, args, pos)
+
+
+def parse_expr(text):
+    """Parse an expression -> its Node tree. Raises ExprError (with the position)."""
+    if not isinstance(text, str):
+        raise ExprError("an expression must be a text, not %r" % (text,))
+    if not text.strip(_SPACE):
+        raise ExprError("empty expression", -1)
+    p = _Parser(text)
+    node = p.expr()
+    if p.peek()[0] != "end":
+        raise p.unexpected(p.peek())
+    return node
+
+
+def expr_name_nodes(node, out=None):
+    """The "name" nodes of a tree in text order, each name once (first appearance)."""
+    if out is None:
+        out = []
+    if node.kind == "name" and all(n.value != node.value for n in out):
+        out.append(node)
+    for a in node.args:
+        expr_name_nodes(a, out)
+    return out
+
+
+def expr_names(node):
+    """The names an expression uses (not function names), in order of first appearance."""
+    return [n.value for n in expr_name_nodes(node)]
+
+
+_REF_TOKEN = re.compile(r'"((?:[^"]|"(?=[A-Za-z0-9_]))*)"?|(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?'
+                        r'[pnumkKMGT\u00b5\u03bc]?|([A-Za-z_][A-Za-z0-9_]*)([ \t\r\n]*\()?')
+
+
+def expr_refs(text):
+    """The names an expression text mentions, found by a quick scan that also works
+    on a broken expression (numbers and function names skipped). Used to order the
+    derived quantities; the same scan as the web app's exprRefs()."""
+    out = []
+    for m in _REF_TOKEN.finditer(text if isinstance(text, str) else ""):
+        name = m.group(1) if m.group(1) is not None else (m.group(2) if not m.group(3) else None)
+        if name and name not in out:
+            out.append(name)
+    return out
+
+
+def c_pow(a, b):
+    """a^b with the rules of C's pow(), which the web app follows too: 1 when
+    a == 1 or b == 0 (even if the other one is NaN), and (-1)^(+-inf) = 1."""
+    a, b = np.asarray(a, dtype=float), np.asarray(b, dtype=float)
+    with np.errstate(all="ignore"):
+        r = np.power(a, b)
+    # numpy computes x^0.5 as sqrt(x) when the exponent is a single number:
+    # sqrt(-inf) = nan and sqrt(-0) = -0, where pow() gives +inf and +0
+    half = b == 0.5
+    r = np.where(half & (a == -np.inf), np.inf, np.where(half & (a == 0), 0.0, r))
+    return np.where((a == 1) | (b == 0) | ((a == -1) & np.isinf(b)), 1.0, r)
+
+
+def _lin2db(x):
+    return np.where(x > 0, 10.0 * np.log10(np.where(x > 0, x, 1.0)), np.nan)
+
+
+# min / max: NaN in any argument -> NaN (np.minimum / np.maximum), and the sign of
+# a zero result as in the app: min(0, -0) = -0, max(0, -0) = 0 (numpy returns
+# whichever operand it happens to pick)
+def _nan_min(*args):
+    r = args[0]
+    for a in args[1:]:
+        m = np.minimum(r, a)
+        r = np.where(m == 0, np.where(np.signbit(r) | np.signbit(a), -0.0, 0.0), m)
+    return r
+
+
+def _nan_max(*args):
+    r = args[0]
+    for a in args[1:]:
+        m = np.maximum(r, a)
+        r = np.where(m == 0, np.where(np.signbit(r) & np.signbit(a), -0.0, 0.0), m)
+    return r
+
+
+_FUNCTION_IMPL = {
+    "abs": np.abs, "sqrt": np.sqrt, "exp": np.exp, "ln": np.log, "log": np.log,
+    "log10": np.log10, "floor": np.floor, "ceil": np.ceil,
+    "round": lambda x: np.floor(x + 0.5),           # halves round up, like the app
+    "db2lin": lambda x: c_pow(10.0, x / 10.0),
+    "lin2db": _lin2db, "pow": c_pow, "min": _nan_min, "max": _nan_max,
+}
+
+
+def eval_expr(node, value_of):
+    """Compute a parsed expression with numpy. value_of(name, pos) returns the
+    values of a name as an array that broadcasts against the result."""
+    with np.errstate(all="ignore"):   # 1/0 = inf, sqrt(-1) = NaN ... as in the app
+        return np.asarray(_ev(node, value_of), dtype=float)
+
+
+def _ev(node, value_of):
+    kind = node.kind
+    if kind == "num":
+        return np.float64(node.value)
+    if kind == "name":
+        return value_of(node.value, node.pos)
+    if kind == "neg":
+        return -_ev(node.args[0], value_of)
+    if kind == "plus":
+        return _ev(node.args[0], value_of)
+    if kind == "call":
+        return _FUNCTION_IMPL[node.value](*[_ev(x, value_of) for x in node.args])
+    # (no list comprehension here: a+b+c+... nests one level per term, and on
+    # Python < 3.12 a comprehension would add a second stack frame per level)
+    a = _ev(node.args[0], value_of)
+    b = _ev(node.args[1], value_of)
+    op = node.value
+    if op == "+":
+        return a + b
+    if op == "-":
+        return a - b
+    if op == "*":
+        return a * b
+    if op == "/":
+        return a / b
+    return c_pow(a, b)   # ^
+
+
+def resolve_name(f, name, pos=-1):
+    """What a name in an expression stands for in file f: ("var", Var) = a numeric
+    variable (derived ones too), ("dim", None) = a dimension without a numeric
+    coordinate variable (its index 0, 1, 2, ...), ("const", value) = pi. A
+    dimension name never means a variable of that name that is not the
+    dimension's own 1-D coordinate (possible in NetCDF-3 files)."""
+    v = f.var(name)
+    is_dim = name in f.sizes
+    if v is not None and v.numeric and (not is_dim or v.dims == (name,)):
+        return "var", v
+    if is_dim:
+        return "dim", None
+    if v is not None:
+        raise ExprError("'%s' is not numeric" % name, pos)
+    if name == "pi":
+        return "const", math.pi
+    raise ExprError("unknown name '%s'" % name, pos)
+
+
+def name_dims(f, name, pos=-1):
+    """The dimensions a name brings into an expression."""
+    kind, v = resolve_name(f, name, pos)
+    return v.dims if kind == "var" else ((name,) if kind == "dim" else ())
+
+
+def name_units(f, name):
+    """Units of a name in an expression ('' for a dimension index, pi or unknown names)."""
+    try:
+        kind, v = resolve_name(f, name)
+    except ExprError:
+        return ""
+    return v.units if kind == "var" else ""
+
+
+def eval_on(f, node, dims):
+    """Evaluate a parsed expression at every element of an array with dimensions
+    'dims' (dimensions of file f). Each name used must have all its dimensions
+    among 'dims'. Returns an array that broadcasts to that array's shape."""
+    dims = tuple(dims)
+
+    def value_of(name, pos):
+        kind, v = resolve_name(f, name, pos)
+        if kind == "const":
+            return np.float64(v)
+        for d in (v.dims if kind == "var" else (name,)):
+            if d not in dims:
+                raise ExprError("'%s' has dimension '%s', which the result lacks" % (name, d), pos)
+        if kind == "var":
+            return as_float(_align(v, dims), v.units)      # time units -> seconds
+        n = f.size(name)
+        return np.arange(n, dtype=float).reshape([n if d == name else 1 for d in dims])
+    return eval_expr(node, value_of)
+
+
+def formula_name_units(f, name):
+    """Units of a name in a formula's automatic units: name_units(), but "s" for
+    time-like units, whose values the expression sees in seconds (otherwise the
+    result would be labelled 'ns' and converted again where it is used)."""
+    u = name_units(f, name)
+    return "s" if u and time_scale(u) != 1.0 else u
+
+
+def _units_norm(u):
+    return js_trim(u).lower()
+
+
+def _pow_units(ua, exponent):
+    """Units of a^b: e.g. 'nm^2' when a has units and b is a plain number, else ''."""
+    sign = 1.0
+    if exponent.kind == "neg" and exponent.args[0].kind == "num":
+        exponent, sign = exponent.args[0], -1.0
+    if ua and exponent.kind == "num":
+        return "%s^%s" % (ua, js_str(sign * exponent.value))
+    return ""
+
+
+def expr_units(node, units_of):
+    """Units of an expression's result, from the units of the names it uses
+    (units_of(name) -> text): dBm - dBm -> dB, W / W -> '', V * A -> V.A (with a
+    middle dot), lin2db(mW) -> dBm, ... (the web app's rules)."""
+    kind = node.kind
+    if kind == "num":
+        return ""
+    if kind == "name":
+        return units_of(node.value)
+    if kind in ("neg", "plus"):
+        return expr_units(node.args[0], units_of)
+    us = []
+    for a in node.args:   # (a loop, not a comprehension: see _ev)
+        us.append(expr_units(a, units_of))
+    if kind == "op":
+        ua, ub = us
+        op = node.value
+        if op == "+":
+            if not ua or not ub:
+                return ua or ub
+            if is_db(ua) and is_db(ub):
+                return ub if _units_norm(ua) == "db" else ua
+            return ua
+        if op == "-":
+            if is_db(ua) and is_db(ub) and _units_norm(ua) == _units_norm(ub):
+                return "dB"
+            return ua or ub
+        if op == "*":
+            return ua + "\u00b7" + ub if (ua and ub) else (ua or ub)
+        if op == "/":
+            if ua and _units_norm(ua) == _units_norm(ub):
+                return ""
+            if ua and ub:
+                return ua + "/" + ub
+            return ua or ("1/" + ub if ub else "")
+        return _pow_units(ua, node.args[1])
+    fn = node.value
+    if fn in ("abs", "floor", "ceil", "round", "min", "max"):
+        return next((u for u in us if u), "")
+    if fn == "pow":
+        return _pow_units(us[0], node.args[1])
+    if fn == "lin2db":
+        return {"mw": "dBm", "w": "dBW"}.get(_units_norm(us[0]), "dB")
+    if fn == "db2lin":
+        return {"dbm": "mW", "dbw": "W", "db": ""}.get(_units_norm(us[0]), "lin(%s)" % us[0] if us[0] else "")
+    return ""  # sqrt exp ln log log10
+
+
+def js_str(x):
+    """A number written the way JavaScript's String(x) writes it: 2, -0.5, 1e-7,
+    1e+21 (the shortest text that reads back as the same number)."""
+    x = float(x)
+    if math.isnan(x):
+        return "NaN"
+    if math.isinf(x):
+        return "Infinity" if x > 0 else "-Infinity"
+    if x == 0:
+        return "0"
+    _sign, digits, exp = Decimal(repr(abs(x))).normalize().as_tuple()
+    digits = "".join(str(d) for d in digits)
+    k, n = len(digits), len(digits) + exp      # n = position of the decimal point
+    if k <= n <= 21:
+        s = digits + "0" * (n - k)
+    elif 0 < n <= 21:
+        s = digits[:n] + "." + digits[n:]
+    elif -6 < n <= 0:
+        s = "0." + "0" * (-n) + digits
+    else:
+        s = digits[0] + ("." + digits[1:] if k > 1 else "") + "e%+d" % (n - 1)
+    return ("-" if x < 0 else "") + s
+
+
+_PLAIN_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+
+
+def quote_name(name):
+    """A name as written in an expression: in double quotes unless it is a plain
+    identifier that is not a function name or pi."""
+    if _PLAIN_NAME.match(name) and name not in FUNCTIONS and name != "pi":
+        return name
+    return '"%s"' % name
+
+
+# ---- 1f. Derived quantities ----------------------------------------------------------
 # A derived quantity is a new variable computed from the variables of ONE file:
 #   reduce    - a statistic over one dimension, optionally restricted to a window
-#               of x values (e.g. the peak power within +-1 MHz of the stimulus)
-#   combine   - a OP b element by element, broadcasting by dimension NAME
-#               (e.g. SNR = peak - floor)
-#   transform - a function of one variable (dB <-> linear, a*x + b, |x|)
+#               of x values whose bounds are expressions, e.g. the peak power
+#               within stimulusFrequency +- 0.01*stimulusFrequency
+#   formula   - an expression of the file's variables (e.g. SNR = peak - floor),
+#               broadcasting by dimension NAME
+#   combine   - a OP b element by element (older projects; formula does more)
+#   transform - a function of one variable (older projects)
 # For dB data, mean / median / std / sum / integral are computed on the LINEAR
 # power 10^(y/10) and converted back to dB (averaging dB numbers directly biases
 # noise low by about 2.5 dB). max / min / argmax are the same either way.
@@ -729,9 +1396,112 @@ class DeriveError(Exception):
 
 STATS = ("max", "min", "mean", "median", "std", "sum", "integral", "count", "argmax_x", "argmin_x")
 REGIONS = ("inside", "outside", "outside_within")
+WINDOW_MODES = ("none", "range", "center")
+WINDOW_FIELDS = ("lo", "hi", "lo2", "hi2", "center", "halfwidth", "halfwidth2")
 OPS = ("-", "+", "*", "/", "max", "min")
 TRANSFORMS = ("db2lin", "lin2db", "scale", "abs")
 NAME_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_ .+\-]{0,63}")
+
+
+def migrate_window(w):
+    """A reduce window in the current format: {"mode", "lo", "hi", "lo2", "hi2",
+    "center", "halfwidth", "halfwidth2"}, every field an expression text ("" = not
+    set). A window written by an older NC Explorer (mode "fixed" with numbers
+    lo/hi/lo2/hi2, or mode "relative" = k*center + offset +- halfwidth with center
+    "coord:<dim>" or "var:<name>") is converted so that it computes exactly the
+    same numbers; a number given for a field becomes its text."""
+    w = w if isinstance(w, dict) else {}
+
+    def is_num(v):
+        return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+    def fin(v):
+        return is_num(v) and math.isfinite(v)
+
+    def text(v):
+        if isinstance(v, str):
+            return v
+        return js_str(v) if fin(v) else ""
+
+    raw_mode = w.get("mode")
+    center = w.get("center")
+    # an old window: mode fixed / relative; or mode none / missing with a k or
+    # offset key (always written by older versions), a number in a field, or a
+    # "coord:" / "var:" center and no other expression text. A "range" /
+    # "center" window is never converted (the web app's rule).
+    legacy = raw_mode in ("fixed", "relative")
+    if not legacy and raw_mode not in ("range", "center"):
+        legacy = ("k" in w or "offset" in w or any(is_num(w.get(k)) for k in WINDOW_FIELDS)
+                  or (isinstance(center, str) and center.startswith(("coord:", "var:"))
+                      and all(k == "center" or not isinstance(w.get(k), str) or w.get(k) == ""
+                              for k in WINDOW_FIELDS)))
+    mode = ("none" if raw_mode is None else str(raw_mode)) or "none"
+    out = {"mode": mode}
+    out.update((k, "") for k in WINDOW_FIELDS)
+    if not legacy:
+        for k in WINDOW_FIELDS:
+            out[k] = text(w.get(k))
+        return out
+    if mode == "fixed":            # only numbers count in an old window
+        out["mode"] = "range"
+        for k in ("lo", "hi", "lo2", "hi2"):
+            out[k] = js_str(w[k]) if fin(w.get(k)) else ""
+    elif mode == "relative":
+        out["mode"] = "center"
+        if isinstance(center, str) and center.startswith(("coord:", "var:")):
+            name = center.split(":", 1)[1][:256]
+            if name:
+                k = w["k"] if fin(w.get("k")) else 1
+                off = w["offset"] if fin(w.get("offset")) else 0
+                c = quote_name(name) if k == 1 else "%s*%s" % (js_str(k), quote_name(name))
+                if off != 0:
+                    c += (" - %s" % js_str(-off)) if off < 0 else (" + %s" % js_str(off))
+                out["center"] = c
+        for k in ("halfwidth", "halfwidth2"):
+            out[k] = js_str(abs(w[k])) if fin(w.get(k)) else ""
+    return out   # "none" (and unknown modes): every field ""
+
+
+_DEF_FIELDS = {
+    "reduce": (("src", ""), ("over", ""), ("xsrc", "index"), ("window", None),
+               ("region", "inside"), ("stat", "max"), ("db", "auto")),
+    "formula": (("expr", ""),),
+    "combine": (("a", ""), ("op", "-"), ("b", "")),
+    "transform": (("src", ""), ("fn", "db2lin"), ("scale", 1.0), ("offset", 0.0)),
+}
+
+
+def normalize_def(d):
+    """A definition with every field present (defaults for missing ones) and, for a
+    reduce, its window in the current format (see migrate_window)."""
+    out = {"name": "", "file": "", "kind": "", "units": "", "description": ""}
+    out.update(d if isinstance(d, dict) else {})
+    for k in ("name", "file", "kind", "units", "description"):
+        if not isinstance(out[k], str):
+            out[k] = "" if out[k] is None else str(out[k])
+    for k, default in _DEF_FIELDS.get(out["kind"], ()):
+        out.setdefault(k, default)
+    if out["kind"] == "reduce":
+        out["window"] = migrate_window(out["window"])
+    return out
+
+
+def expr_failure(what, text, err):
+    """A DeriveError saying which setting is wrong, what is wrong and where, e.g.
+        window halfwidth: unknown name 'RBW' at position 2
+            3*RBW
+              ^"""
+    msg = "%s: %s" % (what, err)
+    if isinstance(text, str) and 0 <= err.pos:
+        # err.pos counts a character outside the BMP as 2 (like the app)
+        col, u = 0, 0
+        while col < len(text) and u < err.pos:
+            u += 2 if ord(text[col]) > 0xFFFF else 1
+            col += 1
+        if u == err.pos:
+            shown = re.sub(r"[\t\r\n]", " ", text)
+            msg += " at position %d\n        %s\n        %s^" % (err.pos, shown, " " * col)
+    return DeriveError(msg)
 
 
 def reduce_samples(x, y, window, region, stat, db):
@@ -783,28 +1553,56 @@ def reduce_samples(x, y, window, region, stat, db):
     return r
 
 
-def window_bounds(win, center=None):
-    """(lo, hi, lo2, hi2) of a window ('center' = the center value of a relative
-    window). A missing outer bound is unbounded on that side. Returns None when a
-    relative window's center k*center + offset is not a finite number: then no
-    sample belongs to ANY region (the result is NaN, or 0 for count)."""
+def eval_setting(f, text, what, dims):
+    """Evaluate the expression of one setting ('what', for messages) over 'dims'."""
+    try:
+        return eval_on(f, parse_expr(text), dims)
+    except ExprError as e:
+        raise expr_failure(what, text, e)
+
+
+def window_bounds(f, win, region, dims, shape):
+    """The window at every element of a reduce's result (dims/shape = the
+    result's): arrays lo, hi (the window), lo2, hi2 (the outer span; +-inf when
+    not used) and 'defined'. Where a needed expression (lo, hi, center,
+    halfwidth, ...) is not a finite number the window is undefined: no sample
+    belongs to ANY region there. (Finite values whose center +- halfwidth
+    overflows give an infinite edge, not an undefined window.)"""
     mode = win["mode"]
+    inf = np.full(shape, math.inf)
     if mode == "none":
-        return (-math.inf, math.inf, -math.inf, math.inf)
-    if mode == "fixed":
-        lo, hi = sorted((float(win["lo"]), float(win["hi"])))
-        lo2 = -math.inf if win["lo2"] is None else float(win["lo2"])
-        hi2 = math.inf if win["hi2"] is None else float(win["hi2"])
-        if lo2 > hi2:
-            lo2, hi2 = hi2, lo2
-        return (lo, hi, lo2, hi2)
-    # relative: centered on k * center + offset
-    mid = win["k"] * center + win["offset"]
-    if not math.isfinite(mid):
-        return None
-    hw = abs(win["halfwidth"])
-    hw2 = abs(win["halfwidth2"]) if win["halfwidth2"] is not None else math.inf
-    return (mid - hw, mid + hw, mid - hw2, mid + hw2)
+        return -inf, inf, -inf, inf, np.ones(shape, dtype=bool)
+    outer = region == "outside_within"
+
+    def value(field, why):
+        text = win.get(field)
+        if not isinstance(text, str) or not text.strip(_SPACE):
+            raise DeriveError("window %s is empty: %s" % (field, why))
+        return np.broadcast_to(eval_setting(f, text, "window " + field, dims), shape)
+
+    with np.errstate(all="ignore"):
+        if mode == "range":     # from lo to hi (either order)
+            a, b = value("lo", "a 'range' window needs lo and hi"), value("hi", "a 'range' window needs lo and hi")
+            lo, hi = np.minimum(a, b), np.maximum(a, b)
+            defined = np.isfinite(a) & np.isfinite(b)
+            if outer:
+                why = "region 'outside_within' needs the outer span lo2 and hi2"
+                a, b = value("lo2", why), value("hi2", why)
+                lo2, hi2 = np.minimum(a, b), np.maximum(a, b)
+                defined &= np.isfinite(a) & np.isfinite(b)
+        else:                   # center +- |halfwidth|
+            why = "a 'center' window needs center and halfwidth"
+            mid = value("center", why)
+            hw = value("halfwidth", why)
+            lo, hi = mid - np.abs(hw), mid + np.abs(hw)
+            defined = np.isfinite(mid) & np.isfinite(hw)
+            if outer:
+                hw2 = value("halfwidth2", "region 'outside_within' needs the outer halfwidth2")
+                lo2, hi2 = mid - np.abs(hw2), mid + np.abs(hw2)
+                defined &= np.isfinite(hw2)
+    if not outer:
+        lo2, hi2 = -inf, inf
+    return lo, hi, lo2, hi2, defined
 
 
 def _numeric_var(f, name, role):
@@ -838,28 +1636,6 @@ def reduce_x_values(f, xsrc, src, over):
     raise DeriveError("unknown x source %r" % xsrc)
 
 
-def center_values(f, center, res_dims, res_shape):
-    """Window center for every element of the result (relative windows)."""
-    if center.startswith("coord:"):
-        dim = center[6:]
-        if dim not in res_dims:
-            raise DeriveError("window center '%s': '%s' is not a dimension of the result (%s)"
-                              % (center, dim, ", ".join(res_dims) or "scalar"))
-        cv = f.var(dim)
-        if cv is not None and cv.numeric and cv.dims == (dim,):
-            c1 = as_float(cv.data, cv.units)
-        else:
-            c1 = np.arange(f.size(dim), dtype=float)
-        return _along(c1, dim, res_dims, res_shape)
-    if center.startswith("var:"):
-        cv = _numeric_var(f, center[4:], "window center")
-        if any(d not in res_dims for d in cv.dims):
-            raise DeriveError("window center '%s' has dims (%s) but the result only has (%s)"
-                              % (cv.name, ", ".join(cv.dims), ", ".join(res_dims)))
-        return np.broadcast_to(as_float(_align(cv, res_dims), cv.units), res_shape)
-    raise DeriveError("a relative window needs a center (coord:<dim> or var:<name>)")
-
-
 def compute_reduce(f, d):
     src = _numeric_var(f, d["src"], "source variable")
     if not src.dims:
@@ -873,26 +1649,15 @@ def compute_reduce(f, d):
         raise DeriveError("unknown statistic %r" % stat)
     if region not in REGIONS:
         raise DeriveError("unknown region %r" % region)
-    if mode not in ("none", "fixed", "relative"):
-        raise DeriveError("unknown window mode %r" % mode)
+    if mode not in WINDOW_MODES:
+        raise DeriveError("unknown window mode %r (none, range or center)" % mode)
     if d["db"] not in ("auto", "yes", "no"):
         raise DeriveError("unknown dB mode %r" % d["db"])
     if mode == "none" and region != "inside":
         raise DeriveError("region '%s' needs a window (the window mode is 'none')" % region)
-    if mode == "fixed":
-        if win["lo"] is None or win["hi"] is None:
-            raise DeriveError("a fixed window needs both lo and hi")
-        if region == "outside_within" and (win["lo2"] is None or win["hi2"] is None):
-            raise DeriveError("region 'outside_within' needs the outer span lo2 and hi2")
     res_dims = tuple(dm for dm in src.dims if dm != over)
     res_shape = tuple(f.size(dm) for dm in res_dims)
-    centers = None
-    if mode == "relative":
-        if win["halfwidth"] is None:
-            raise DeriveError("a relative window needs a halfwidth")
-        if region == "outside_within" and win["halfwidth2"] is None:
-            raise DeriveError("region 'outside_within' needs the outer halfwidth2")
-        centers = center_values(f, win["center"], res_dims, res_shape)
+    lo, hi, lo2, hi2, defined = window_bounds(f, win, region, res_dims, res_shape)
     db = d["db"] == "yes" or (d["db"] == "auto" and is_db(src.units))
     # y and x with the reduced dimension LAST: shape = result shape + (n,)
     ax = src.dims.index(over)
@@ -900,12 +1665,32 @@ def compute_reduce(f, d):
     X = np.moveaxis(reduce_x_values(f, d["xsrc"], src, over), ax, -1)
     out = np.full(res_shape, math.nan)
     for I in np.ndindex(*res_shape):  # one 1-D slice per result element
-        bounds = window_bounds(win, float(centers[I]) if centers is not None else None)
-        if bounds is None:  # relative window around a NaN center: no sample counts
+        if not defined[I]:            # undefined window: no sample counts
             out[I] = 0.0 if stat == "count" else math.nan
         else:
+            bounds = (float(lo[I]), float(hi[I]), float(lo2[I]), float(hi2[I]))
             out[I] = reduce_samples(X[I], Y[I], bounds, region, stat, db)
     return res_dims, out
+
+
+def compute_formula(f, d):
+    """An expression of the file's variables. The result has the dimensions of the
+    names it uses, in order of first appearance (only numbers: a scalar)."""
+    text = d["expr"]
+    if not isinstance(text, str) or not text.strip(_SPACE):
+        raise DeriveError("the formula (expr) is empty")
+    try:
+        node = parse_expr(text)
+        dims = []
+        for nm in expr_name_nodes(node):
+            for dm in name_dims(f, nm.value, nm.pos):
+                if dm not in dims:
+                    dims.append(dm)
+        values = eval_on(f, node, dims)
+    except ExprError as e:
+        raise expr_failure("formula", text, e)
+    shape = tuple(f.size(dm) for dm in dims)
+    return tuple(dims), np.array(np.broadcast_to(values, shape), dtype=float)
 
 
 def compute_combine(f, d):
@@ -931,9 +1716,9 @@ def compute_combine(f, d):
         elif op == "/":
             r = A / B
         elif op == "max":
-            r = np.maximum(A, B)   # NaN in either operand -> NaN
+            r = _nan_max(A, B)     # NaN in either operand -> NaN
         else:
-            r = np.minimum(A, B)
+            r = _nan_min(A, B)
     shape = tuple(f.size(dm) for dm in dims)
     return dims, np.array(np.broadcast_to(r, shape), dtype=float)
 
@@ -955,7 +1740,8 @@ def compute_transform(f, d):
     return s.dims, np.array(r, dtype=float)
 
 
-COMPUTE = {"reduce": compute_reduce, "combine": compute_combine, "transform": compute_transform}
+COMPUTE = {"reduce": compute_reduce, "formula": compute_formula,
+           "combine": compute_combine, "transform": compute_transform}
 
 
 def auto_units(f, d):
@@ -965,7 +1751,7 @@ def auto_units(f, d):
         return v.units if v is not None else ""
 
     def norm(u):
-        return u.strip().lower()
+        return js_trim(u).lower()
 
     kind = d["kind"]
     if kind == "reduce":
@@ -980,6 +1766,11 @@ def auto_units(f, d):
         if st == "count":
             return ""
         return xu  # argmax_x / argmin_x
+    if kind == "formula":
+        try:
+            return expr_units(parse_expr(d["expr"]), lambda name: formula_name_units(f, name))
+        except ExprError:
+            return ""
     if kind == "combine":
         b_is_var = isinstance(d["b"], str)
         ua, ub = units(d["a"]), (units(d["b"]) if b_is_var else "")
@@ -1007,30 +1798,49 @@ def auto_units(f, d):
     return ""
 
 
+def window_fields_used(mode, region):
+    """The window fields a reduce uses: the window itself (unless mode "none") and
+    the outer span only for region "outside_within"."""
+    inner = {"range": ["lo", "hi"], "center": ["center", "halfwidth"]}.get(mode, [])
+    if inner and region == "outside_within":
+        return inner + (["lo2", "hi2"] if mode == "range" else ["halfwidth2"])
+    return inner
+
+
 def def_deps(d):
-    """Variable names a definition reads (other derived variables among them)."""
+    """Variable names a definition reads (other derived variables among them): its
+    source / operands / x source and every name its expressions mention (only the
+    window fields in use, like the web app)."""
     out = []
 
     def add(n):
         if isinstance(n, str) and n and n not in out:
             out.append(n)
-    if d["kind"] == "reduce":
+    kind = d["kind"]
+    if kind == "reduce":
         add(d["src"])
-        if d["xsrc"].startswith("var:"):
+        if isinstance(d["xsrc"], str) and d["xsrc"].startswith("var:"):
             add(d["xsrc"][4:])
-        if d["window"]["center"].startswith("var:"):
-            add(d["window"]["center"][4:])
-    elif d["kind"] == "combine":
+        for k in window_fields_used(d["window"]["mode"], d["region"]):
+            for n in expr_refs(d["window"][k]):
+                add(n)
+    elif kind == "formula":
+        for n in expr_refs(d["expr"]):
+            add(n)
+    elif kind == "combine":
         add(d["a"])
         add(d["b"])
     else:
-        add(d["src"])
+        add(d.get("src"))
     return out
 
 
 def derived_order(f, defs, warn):
     """Order the definitions of ONE file so each comes after the ones it uses.
-    Returns (ordered defs, {name: error}) - bad names and cycles are errors."""
+    Returns (ordered defs, {name: error}) - bad names and cycles are errors.
+    (New quantities cannot be named like a function or pi in the app, but older
+    ones may be, e.g. "floor": they still compute, as in the app. In an
+    expression, floor(x) is the function and a bare floor is the variable.)"""
     errors, by_name = {}, {}
     for d in defs:
         name = d["name"]
@@ -1071,6 +1881,7 @@ def compute_derived(files, defs, warn):
     their files as ordinary variables. Returns {(file, name): None or error}."""
     status, by_file = {}, {}
     for d in defs:
+        d = normalize_def(d)
         by_file.setdefault(d["file"], []).append(d)
     for fname, fdefs in by_file.items():
         f = files.get(fname)
@@ -1082,22 +1893,45 @@ def compute_derived(files, defs, warn):
         for name, msg in errors.items():
             status[(fname, name)] = msg
         for d in order:
-            failed = [dep for dep in def_deps(d) if status.get((fname, dep))]
+            # a failed dependency fails this one too - unless the name means
+            # something else here (a real variable or a dimension of the file)
+            failed = [dep for dep in def_deps(d) if status.get((fname, dep))
+                      and not f.is_real(dep) and dep not in f.sizes]
             if failed:
                 status[(fname, d["name"])] = "uses '%s', which could not be computed" % failed[0]
                 continue
             try:
-                dims, data = COMPUTE[d["kind"]](f, d)
+                compute = COMPUTE.get(d["kind"])
+                if compute is None:
+                    raise DeriveError("unknown kind %r" % d["kind"])
+                dims, data = compute(f, d)
                 data = np.where(np.isfinite(data), data, np.nan)
-                units = d["units"].strip() or auto_units(f, d)
+                units = js_trim(d["units"]) or auto_units(f, d)
                 f.add_derived(Var(d["name"], dims, data, units, numeric=True, derived=True))
                 status[(fname, d["name"])] = None
             except DeriveError as e:
                 status[(fname, d["name"])] = str(e)
+            except Exception as e:  # a bug or a hand-edited definition of the wrong shape
+                status[(fname, d["name"])] = "%s: %s" % (type(e).__name__, e)
     return status
 
 
-# ---- 1f. From a trace to lines ----------------------------------------------------
+def failed_derived(tab, status):
+    """The derived variables that a tab's VISIBLE traces use (as y, x or sweep-value
+    source) but that could not be computed: [(file, name), ...]."""
+    out = []
+    for t in tab["traces"]:
+        if not t["visible"]:
+            continue
+        names = [t["var"]] + [s[4:] for s in (t["xsrc"], t["ssrc"]) if s.startswith("var:")]
+        for name in names:
+            key = (t["file"], name)
+            if name and status.get(key) and key not in out:
+                out.append(key)
+    return out
+
+
+# ---- 1g. From a trace to lines ----------------------------------------------------
 def normalize_trace(f, t):
     """The fix-ups the app applies to a loaded trace: an unknown line dim becomes the
     variable's last dim; a sweep that is not a dim (or is the line dim) is dropped."""
@@ -1231,7 +2065,7 @@ def line_label(t, sweep, sval, j):
     base = t["label"] or t["var"]
     if sval is None:
         return base
-    tmpl = (t["sweep_label"] or "").strip()
+    tmpl = js_trim(t["sweep_label"])
     if tmpl:
         return (tmpl.replace("{label}", base).replace("{sweep}", sweep or "")
                 .replace("{v}", fmt6(sval)).replace("{n}", str(j)))
@@ -1267,7 +2101,7 @@ def auto_labels(files, traces):
     return xl, yl_left, yl_right
 
 
-# ---- 1g. Colors ----------------------------------------------------------------------
+# ---- 1h. Colors ----------------------------------------------------------------------
 def cmap_color(name, t):
     """RGB color at position t (0..1) of a colormap: the same piecewise-linear
     interpolation, rounded to whole RGB values, as the web app."""
@@ -1288,7 +2122,7 @@ def mpl_colormap(name):
         "ncx_" + name, [(i / n, tuple(c / 255.0 for c in rgb)) for i, rgb in enumerate(stops)], N=256)
 
 
-# ---- 1h. Drawing one page --------------------------------------------------------------
+# ---- 1i. Drawing one page --------------------------------------------------------------
 def figure_size(c):
     """(width, height) in inches: the tab's locked plot size, else FIGSIZE_DEFAULT."""
     def clamp(v, default):
@@ -1504,7 +2338,7 @@ def draw_tab(tab, files):
             notes.append("colorbar source is an index - SI scaling not applied")
         lo, hi = ranges[shared][0] / cf, ranges[shared][1] / cf
         src_label = sweep_source_label(files.get(rep["t"]["file"]), rep["t"], shared)
-        caption = (c["clabel"] or "").strip() or (src_label if is_index else scaled_label(src_label, c["cunit"]))
+        caption = js_trim(c["clabel"]) or (src_label if is_index else scaled_label(src_label, c["cunit"]))
         sm = ScalarMappable(norm=Normalize(lo, hi if hi > lo else lo + 1), cmap=mpl_colormap(c["cmap"]))
         sm.set_array(np.array([]))
         cb = fig.colorbar(sm, ax=ax, pad=0.02, aspect=30)
@@ -1613,15 +2447,53 @@ def draw_tab(tab, files):
 # CONFIG["derived"]: derived quantities, computed in dependency order and then
 #   usable like any variable of their file. Kinds:
 #   reduce   : stat of 'src' over dim 'over'. x values along 'over' come from
-#              'xsrc' ("index", "coord" or "var:<name>"). window.mode "none" (all
-#              x), "fixed" ([lo, hi]; outer span [lo2, hi2]) or "relative"
-#              (k*center + offset +- halfwidth; center "coord:<dim>" or
-#              "var:<name>"; outer halfwidth2). region "inside", "outside" or
-#              "outside_within". stat: max min mean median std sum integral
-#              count argmax_x argmin_x. db "auto" (from units) / "yes" / "no".
+#              'xsrc' ("index", "coord" or "var:<name>"). window.mode:
+#                "none"   all x values (region must be "inside");
+#                "range"  from lo to hi; outer span from lo2 to hi2;
+#                "center" center +- halfwidth; outer span center +- halfwidth2.
+#              Window fields are EXPRESSIONS (see below) computed for every
+#              element of the result, so they can follow the variables that
+#              vary along the result's dimensions: e.g. center
+#              "stimulusFrequency" with halfwidth "0.01*stimulusFrequency" or
+#              "3*ResolutionBWs". Where a bound is not a finite number the
+#              window is undefined: no sample counts (result NaN, count 0).
+#              region "inside", "outside" or "outside_within" (outside the
+#              window but inside the outer span). stat: max min mean median std
+#              sum integral count argmax_x argmin_x. db "auto" (from units) /
+#              "yes" / "no" (dB data: mean median std sum integral are taken
+#              on linear power).
+#   formula  : expr = an expression of the file's variables, e.g. "peak - floor"
+#              or "floor - 10*log10(ResolutionBWs)". The result has the
+#              dimensions of the names it uses, in order of first appearance.
 #   combine  : a op b (op - + * / max min); b is a variable name or a number.
 #   transform: fn "db2lin", "lin2db", "scale" (x*scale + offset) or "abs".
-#   units "" = automatic.
+#   units "" = automatic (dBm - dBm -> dB, W/W -> no units, lin2db(mW) -> dBm ...).
+#
+# Expressions (window fields and formulas):
+#   numbers    12  0.5  .5  2e-3  1.5E6, optionally followed (no space) by an SI
+#              suffix p n u m k K M G T (u, or a micro sign, = 1e-6): 300k =
+#              300000, 2.5M = 2500000, 10u = 0.00001. Errors: 5ms, 2e, 1.2.3.
+#   names      a numeric variable of the same file (derived ones too; time units
+#              are converted to seconds, and a formula using one gets units
+#              "s") or a dimension: its coordinate variable, or its index 0, 1,
+#              2, ... when it has none. A name that is not a plain identifier
+#              (letters, digits, _) goes in double quotes: "peak f", "wl.nm"
+#              (a " directly followed by a letter, digit or _ is part of the
+#              name: "a"b" is a"b). pi = 3.14159... (unless a variable is
+#              called pi).
+#   operators  + - * /, ^ or ** for powers, ( ) for grouping. ^ binds tightest
+#              and from the right: -a^2 = -(a^2), a^b^c = a^(b^c), 2^-x is fine.
+#              At most 64 levels of nested ( ), signs, ^ and function calls.
+#   functions  abs(x) sqrt(x) exp(x) ln(x) log(x) (= ln) log10(x) floor(x)
+#              ceil(x) round(x) (halves up) db2lin(x) (= 10^(x/10)) lin2db(x)
+#              (= 10*log10(x); NaN for x <= 0) pow(a, b) min(a, b, ...)
+#              max(a, b, ...) (min/max: NaN if any argument is NaN)
+#   Variables with different dimensions combine by dimension NAME (like
+#   xarray). A window expression may only use names whose dimensions the
+#   result has (not the reduced dimension). Plain IEEE arithmetic: 1/0 = inf,
+#   sqrt(-1) = NaN, and NaN anywhere gives NaN. A mistake (unknown name,
+#   syntax error) is reported with its position; that quantity is skipped, and
+#   so is every page that plots it.
 #
 # CONFIG["tabs"]: one PDF page each ("index" = the tab's position in the app).
 #   plot   : cosmetics. mode "2D lines" / "Rainbow" / "3D waterfall"; labels
@@ -1753,6 +2625,12 @@ def main(argv=None):
                              if t["visible"] and files.get(t["file"]) is None))
         if missing:
             warn("%s skipped: data file(s) not available: %s" % (head, ", ".join(missing)))
+            skipped += 1
+            continue
+        broken = failed_derived(tab, status)
+        if broken:
+            warn("%s skipped: it plots %s, which could not be computed (see above)"
+                 % (head, ", ".join("derived '%s' (%s)" % (n, fn) for fn, n in broken)))
             skipped += 1
             continue
         try:

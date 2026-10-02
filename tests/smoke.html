@@ -171,13 +171,15 @@ async function load(url) {
     // ---- derived quantities (derive.js) on real data, in the browser ----
     try {
       const dp = await load("data/darpa.nc");
-      const win = { mode: "relative", lo: null, hi: null, lo2: null, hi2: null, center: "coord:stimulusFrequency",
-        k: 1, offset: 0, halfwidth: 1e6, halfwidth2: null };
+      const win = { mode: "center", lo: "", hi: "", lo2: "", hi2: "", center: "stimulusFrequency",
+        halfwidth: "1M", halfwidth2: "" };
       const base = { ...D.newDef("reduce", "darpa.nc"), src: "spectrums", over: "TraceIndex", xsrc: "var:frequencies", window: win };
       const defs = [
         { ...base, name: "pk", stat: "max", region: "inside" },
         { ...base, name: "fl", stat: "mean", region: "outside" },
-        { ...D.newDef("combine", "darpa.nc"), name: "snr", a: "pk", op: "-", b: "fl" },
+        { ...D.newDef("formula", "darpa.nc"), name: "snr", expr: "pk - fl" },
+        // a half width proportional to the RBW used for each spectrum
+        { ...base, name: "pk_rbw", stat: "max", region: "inside", window: { ...win, halfwidth: "3*ResolutionBWs" } },
       ];
       const st = D.registerDerived(dp, defs);
       check("derived: peak/floor/SNR register on darpa", [...st.values()].every((s) => s.ok),
@@ -185,6 +187,7 @@ async function load(url) {
       const pk = dp.variable("pk"), fl = dp.variable("fl"), snr = dp.variable("snr");
       check("derived: result dims drop the reduced dim", pk.dims.join(",") === "stimulusFrequency,stimulusAmp,trace", pk.dims.join(","));
       check("derived: SNR = peak - floor", Array.from(snr.data).every((v, i) => Math.abs(v - (pk.data[i] - fl.data[i])) < 1e-12));
+      check("derived: RBW-proportional window computes", dp.has("pk_rbw") && Array.from(dp.variable("pk_rbw").data).every(Number.isFinite));
       check("derived: dB units auto (DBM -> dB for SNR)", snr.attrs.units === "dB" && pk.attrs.units === "DBM", snr.attrs.units);
       // the floor of dB data is a LINEAR-power mean: it must sit above the dB-domain mean
       const t = X.makeTrace("darpa.nc", "spectrums", "TraceIndex", "var:frequencies", "", { stimulusFrequency: 0, stimulusAmp: 0, trace: 0 });
@@ -199,7 +202,7 @@ async function load(url) {
       check("derived: traceLines over a derived var", r.lines.length === 1 && r.lines[0].y.length === 2 && r.lines[0].x[1] === 1e8);
       const sb2 = await load("data/sidebands.nc");
       D.registerDerived(sb2, [{ ...D.newDef("reduce", "sidebands.nc"), name: "pump_pk", src: "spectra_dbm", over: "wl", xsrc: "var:wl_nm",
-        window: { ...win, center: "var:pump_nm", halfwidth: 0.02 }, stat: "max" }]);
+        window: { ...win, center: "pump_nm", halfwidth: "0.02" }, stat: "max" }]);
       const a = sb2.variable("pump_pk").data, b = sb2.variable("pump_dbm").data;
       check("derived: sidebands peak at pump_nm ± 0.02 == stored pump_dbm", Array.from(a).every((v, i) => v === b[i]));
     } catch (e) { check("derived quantities test", false, e.message); }

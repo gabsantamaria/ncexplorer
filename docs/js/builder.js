@@ -1,27 +1,49 @@
 // builder.js — the "Derived quantity" dialog. Left: a form for one definition
-// (a windowed statistic over a dimension, a combination a ∘ b, or a transform),
-// with presets for the common lab cases (peak in a window, noise floor outside
-// it, and peak + floor + SNR in one go). Right: a live preview — one source line
+// (a windowed statistic over a dimension, or a formula), with presets for the
+// common lab cases (peak in a window, noise floor outside it, and peak + floor +
+// SNR in one go). Window settings and formulas are EXPRESSIONS (e.g. a half
+// width of 0.01*stimulusFrequency or 3*ResolutionBWs), with a picker that
+// inserts variable / function names. Right: a live preview — one source line
 // (e.g. one spectrum) with the window drawn as draggable shaded bands, and the
-// resulting quantity vs a remaining dimension. All computation is derive.js; this
-// file is only the UI. The app passes a context (state, X, D, commitDerived …).
+// resulting quantity vs a remaining dimension. All computation is derive.js /
+// expr.js; this file is only the UI. The app passes a context (state, X, D, …).
 
-import { h, modal, parseNum, fmtSI, ask } from "./ui.js";
+import { h, modal, menu, parseNum, fmtSI, ask } from "./ui.js";
+import { parseExpr, exprNames, quoteName, num } from "./expr.js";
 
 const CYCLE = ["#1565c0", "#c0392b", "#0d6b3f", "#7d3cff", "#e6a700", "#00838f", "#ad1457", "#4e342e"];
 const KINDS = [
   { id: "reduce", label: "Window statistic", title: "reduce one dimension: peak, mean, … of the points in an x window" },
-  { id: "combine", label: "Combine a ∘ b", title: "a − b, a ÷ b, … (e.g. SNR = peak − floor), broadcast by dimension name" },
-  { id: "transform", label: "Transform", title: "dB ↔ linear, a·x + b, |x|" },
+  { id: "formula", label: "Formula", title: "any expression of variables, e.g. peak - floor or floor - 10*log10(ResolutionBWs)" },
 ];
 const PRESETS = [
   { id: "peak", label: "Peak in window", title: "largest value inside a window (e.g. around the stimulus frequency)" },
   { id: "floor", label: "Noise floor outside", title: "mean (in linear power for dB data) outside the window" },
   { id: "snr", label: "Peak + floor + SNR", title: "creates three quantities at once: peak, floor and SNR = peak − floor" },
-  { id: "custom", label: "Custom", title: "any statistic / combination / transform" },
+  { id: "custom", label: "Custom", title: "any statistic, or a formula" },
 ];
-const OP_WORD = { "-": "minus", "+": "plus", "*": "times", "/": "over", max: "max", min: "min" };
-const FN_WORD = { db2lin: "lin", lin2db: "dB", scale: "scaled", abs: "abs" };
+
+// an old "combine" / "transform" definition as the equivalent formula text
+function legacyFormula(d) {
+  const q = (n) => quoteName(String(n || "x"));
+  if (d.kind === "combine") {
+    const b = typeof d.b === "number" ? num(d.b) : q(d.b);
+    if (d.op === "max" || d.op === "min") return `${d.op}(${q(d.a)}, ${b})`;
+    return `${q(d.a)} ${d.op} ${b}`;
+  }
+  if (d.kind === "transform") {
+    if (d.fn === "scale") {
+      const sc = d.scale ?? 1, off = d.offset ?? 0;
+      return `${sc === 1 ? "" : num(sc) + "*"}${q(d.src)}${off ? (off < 0 ? ` - ${num(-off)}` : ` + ${num(off)}`) : ""}`;
+    }
+    return `${d.fn}(${q(d.src)})`;
+  }
+  return "";
+}
+// names an expression refers to ([] when it doesn't parse)
+function namesIn(text) {
+  try { return exprNames(parseExpr(String(text || ""))); } catch (e) { return []; }
+}
 
 export function openBuilder(ctx, opts = {}) {
   const { state, D, X } = ctx;
@@ -104,37 +126,45 @@ export function openBuilder(ctx, opts = {}) {
     } catch (e) { return null; }
   }
   const nice = (v) => (v ? parseFloat(v.toPrecision(2)) : 0);
-  // pick a center source whose value lies inside the x range of the line
+  // pick a window-center name whose value (at the previewed slice) lies inside
+  // the line's x range — e.g. stimulusFrequency for a spectrum around it
   function defaultCenter(def) {
-    const opts2 = D.centerSourceOptions(ds(), def.src, def.over);
     const xr = xRange(def);
-    if (!opts2.length) return { center: "", ok: false };
+    let cands = [];
+    try { cands = D.windowNames(ds(), def.src, def.over); } catch (e) { cands = []; }
+    if (!cands.length) return { center: "", value: NaN, ok: false };
     if (xr) {
-      for (const c of opts2) {
-        try {
-          const test = { ...def, window: { ...def.window, mode: "relative", center: c, k: 1, offset: 0, halfwidth: 0 }, region: "inside" };
-          const p = D.previewSlice(ds(), test, S.slice);
-          if (Number.isFinite(p.center) && p.center >= xr[0] && p.center <= xr[1] && p.center !== xr[0]) return { center: c, ok: true };
-        } catch (e) { /* try the next */ }
+      for (const c of cands) {
+        const center = quoteName(c.name);
+        const test = { ...def, window: { ...def.window, mode: "center", center, halfwidth: "0" }, region: "inside" };
+        const v = D.exprValueAt(ds(), test, "center", S.slice);
+        if (Number.isFinite(v) && v > xr[0] && v <= xr[1]) return { center, value: v, ok: true };
       }
     }
-    return { center: opts2[0], ok: false };
+    return { center: quoteName(cands[0].name), value: NaN, ok: false };
   }
-  function setupWindow(def, wantRelative) {
+  // a half width as an expression: proportional to the center when the line's
+  // x span scales with it (e.g. analyzer span = f0), else a plain number
+  function widthExpr(width, c, span) {
+    if (c.ok && Number.isFinite(c.value) && c.value > 0 && span / c.value > 0.05)
+      return `${num(nice(width / c.value))}*${c.center}`;
+    return num(nice(width) || 1);
+  }
+  function setupWindow(def, wantCenter) {
     const xr = xRange(def);
     const span = xr ? xr[1] - xr[0] : 0;
-    if (wantRelative) {
+    if (wantCenter) {
       const c = defaultCenter(def);
       if (c.ok) {
-        def.window = { ...def.window, mode: "relative", center: c.center, k: 1, offset: 0,
-          halfwidth: nice(span * 0.01) || 1, halfwidth2: nice(span * 0.25) || 10 };
+        def.window = { ...def.window, mode: "center", center: c.center,
+          halfwidth: widthExpr(span * 0.01, c, span), halfwidth2: widthExpr(span * 0.25, c, span) };
         return;
       }
     }
     if (xr) {
       const mid = (xr[0] + xr[1]) / 2;
-      def.window = { ...def.window, mode: "fixed", lo: nice(mid - span * 0.05), hi: nice(mid + span * 0.05),
-        lo2: nice(mid - span * 0.3), hi2: nice(mid + span * 0.3) };
+      def.window = { ...def.window, mode: "range", lo: num(nice(mid - span * 0.05)), hi: num(nice(mid + span * 0.05)),
+        lo2: num(nice(mid - span * 0.3)), hi2: num(nice(mid + span * 0.3)) };
     }
   }
 
@@ -175,8 +205,7 @@ export function openBuilder(ctx, opts = {}) {
     const d = S.def;
     if (!d) return;
     let base;
-    if (d.kind === "combine") base = `${d.a || "a"}_${OP_WORD[d.op] || "op"}_${typeof d.b === "number" ? "c" : (d.b || "b")}`;
-    else if (d.kind === "transform") base = `${d.src || "x"}_${FN_WORD[d.fn] || d.fn}`;
+    if (d.kind === "formula") { const nm = namesIn(d.expr); base = nm.length ? `${nm[0]}_expr` : "formula"; }
     else if (S.preset === "peak" || S.preset === "snr") base = `${d.src}_peak`;
     else if (S.preset === "floor") base = `${d.src}_floor`;
     else base = `${d.src}_${d.stat === "argmax_x" ? "xpeak" : d.stat === "argmin_x" ? "xmin" : d.stat}${d.region === "inside" ? "" : "_out"}`;
@@ -195,10 +224,13 @@ export function openBuilder(ctx, opts = {}) {
     for (const k of Object.keys(S.slice)) if (!dims.includes(k)) delete S.slice[k];
     if (!force && dims.includes(S.vs) && (!S.lines || dims.includes(S.lines))) return;
     const d = ds();
-    const w = S.def && S.def.window;
-    const cdim = w && w.mode === "relative" && typeof w.center === "string" && w.center.startsWith("coord:")
-      ? w.center.slice(6) : null;
-    if (cdim && dims.includes(cdim) && d.size(cdim) > 1) S.vs = cdim;
+    const w = S.def && S.def.kind === "reduce" && S.def.window;
+    // the dim the window follows (e.g. stimulusFrequency) is the natural x axis
+    const follow = w && w.mode !== "none"
+      ? [...namesIn(w.center), ...namesIn(w.lo), ...namesIn(w.halfwidth)]
+        .flatMap((n) => (d.vars[n] ? d.vars[n].dims : [n])).find((dd) => dims.includes(dd) && d.size(dd) > 1)
+      : null;
+    if (follow) S.vs = follow;
     else {
       let best = dims[0] || "";
       for (const dim of dims) if (d.size(dim) > d.size(best)) best = dim;
@@ -217,14 +249,20 @@ export function openBuilder(ctx, opts = {}) {
     const floor = D.canonicalDef(d);
     floor.name = S.names.floor; floor.stat = S.floorStat; floor.region = S.floorRegion;
     floor.units = ""; floor.description = "";
-    const snr = D.newDef("combine", S.file);
-    snr.name = S.names.snr; snr.a = d.name; snr.op = "-"; snr.b = floor.name;
+    const snr = D.newDef("formula", S.file);
+    snr.name = S.names.snr; snr.expr = `${quoteName(d.name)} - ${quoteName(floor.name)}`;
     return [d, floor, snr];
   }
 
   // ---------------------------------------------------------------- init def
   if (opts.edit) {
     S.def = D.canonicalDef(opts.edit);
+    if (S.def.kind === "combine" || S.def.kind === "transform") {
+      // edited as the equivalent formula (saved as kind "formula")
+      const f = D.newDef("formula", S.def.file);
+      f.expr = legacyFormula(S.def); f.units = S.def.units; f.description = S.def.description;
+      S.def = f;
+    }
     S.names.main = opts.edit.name;
     if (opts.asNew) S.nameTouched = true;
   } else {
@@ -284,20 +322,128 @@ export function openBuilder(ctx, opts = {}) {
   };
   const field = (lt, ctl, title) => h("label", { title: title || null }, h("span", { class: "lt", text: lt }), ctl);
   const note = (html, cls = "") => h("div", { class: "note " + cls, html });
-  const numInput = (val, onval, ph, title) => {
-    const inp = h("input", { type: "text", value: val == null ? "" : fmtSI(val), placeholder: ph || "", title: title || "accepts SI suffixes: 5k, 1.5M, 2G, 10m, 3u" });
-    inp.oninput = () => {
-      const v = parseNum(inp.value);
-      inp.classList.toggle("bad", inp.value.trim() !== "" && v === null);
-      if (v !== null || inp.value.trim() === "") { onval(v); schedule(); }
-    };
-    return inp;
-  };
   const set = (k, v, rerender = true) => { S.def[k] = v; autoNames(); pickResultAxes(); if (rerender) render(); else schedule(); };
-  const setW = (k, v, rerender = false) => { S.def.window[k] = v; if (rerender) { autoNames(); pickResultAxes(); render(); } else schedule(); };
+
+  // ---- expression inputs ----------------------------------------------------
+  // a text box bound to one expression field (window bound / formula), checked
+  // live; it shows the value the expression takes at the previewed slice
+  let exprInputs = [];        // rebuilt on every render
+  let lastExpr = null;        // the expression box the picker inserts into
+  function exprInput(field, label, placeholder, title, target) {
+    const obj = target();
+    const inp = h("input", { type: "text", class: "expr", value: obj[field] || "", placeholder,
+      spellcheck: false, autocomplete: "off" });
+    const val = h("span", { class: "expr-val", title: "value at the previewed slice" });
+    const err = h("div", { class: "note err expr-err", hidden: true });
+    // the picker inserts into the box last focused / clicked / typed in
+    const own = () => { if (!lastExpr || lastExpr.inp !== inp) { lastExpr = { inp, field }; markTarget(); } };
+    inp.oninput = () => { own(); target()[field] = inp.value; autoNames(); schedule(); };
+    inp.onfocus = own;
+    inp.onclick = own;
+    inp.onkeyup = own;
+    const row = h("label", { class: "expr-row", title }, h("span", { class: "lt", text: label }), inp, val);
+    exprInputs.push({ field, inp, val, err });
+    return [row, err];
+  }
+  function markTarget() {
+    for (const e of exprInputs) e.inp.classList.toggle("target", !!lastExpr && e.inp === lastExpr.inp);
+  }
+  // insert text at the cursor of the target box (a function wraps the selection)
+  function insertIntoExpr(text, isFunc) {
+    const t = (lastExpr && document.body.contains(lastExpr.inp)) ? lastExpr : exprInputs[0];
+    if (!t) return;
+    const inp = t.inp;
+    const a = inp.selectionStart ?? inp.value.length, b = inp.selectionEnd ?? inp.value.length;
+    const selTxt = inp.value.slice(a, b);
+    const ins = isFunc ? `${text}(${selTxt})` : text;
+    inp.value = inp.value.slice(0, a) + ins + inp.value.slice(b);
+    const caret = isFunc && !selTxt ? a + text.length + 1 : a + ins.length;
+    inp.focus();
+    inp.setSelectionRange(caret, caret);
+    inp.dispatchEvent(new Event("input"));
+    lastExpr = t; markTarget();
+  }
+  // clickable names (variables / dimensions) + a functions menu + syntax help
+  function picker(names, what) {
+    const box = h("div", { class: "picker" });
+    box.appendChild(h("span", { class: "picker-t", text: "Insert:" }));
+    for (const n of names) {
+      const dimsTxt = n.dims && n.dims.length ? n.dims.join(", ") : "scalar";
+      const chip = h("button", { class: "chip" + (n.isDim ? " dim" : ""), type: "button",
+        title: `${n.name}${n.units ? ` (${n.units})` : ""} — ${n.isDim ? "dimension index / coordinate" : `dims: ${dimsTxt}`}`
+          + (what === "window" ? "\nits value for the spectrum being reduced" : "") },
+      n.label || n.name);
+      chip.onmousedown = (e) => e.preventDefault();        // keep the focus in the expression box
+      chip.onclick = () => insertIntoExpr(quoteName(n.name), false);
+      box.appendChild(chip);
+    }
+    const fn = h("button", { class: "chip fn", type: "button", text: "ƒ functions ▾", title: "insert a function" });
+    fn.onmousedown = (e) => e.preventDefault();
+    fn.onclick = () => menu(fn, D.FUNCTIONS.map((f) => ({ label: f.sig, hint: f.doc, onClick: () => insertIntoExpr(f.name, true) })));
+    const help = h("button", { class: "chip link", type: "button", text: "syntax ?", title: "how expressions work" });
+    help.onclick = () => showExprHelp(what);
+    box.append(fn, help);
+    return box;
+  }
+
+  // numbers written into expressions by drags. Positions are snapped to ~1/1000
+  // of the visible x span (a pixel is coarser than that anyway); ratios to 2
+  // significant digits, so a drag yields "6*RBW", not "6.037*RBW"
+  const fmtE = (v) => fmtSI(parseFloat(Number(v).toPrecision(6)));
+  function snapX(v) {
+    const xa = pvPlot._fullLayout && pvPlot._fullLayout.xaxis;
+    const span = xa && xa.range ? Math.abs(xa.range[1] - xa.range[0]) : NaN;
+    if (!Number.isFinite(span) || span <= 0 || !Number.isFinite(v)) return v;
+    const step = Math.pow(10, Math.floor(Math.log10(span)) - 3);
+    return Math.round(v / step) * step;
+  }
+  const fmtX = (v) => fmtE(snapX(v));
+  const fmtR = (v) => fmtSI(parseFloat(Number(v).toPrecision(2)));
+  // does `t` have a + or - at the top level (outside parentheses / quotes)?
+  function topLevelAddSub(t) {
+    let depth = 0, q = false;
+    for (let i = 0; i < t.length; i++) {
+      const c = t[i];
+      if (c === '"') { q = !q; continue; }
+      if (q) continue;
+      if (c === "(") depth++;
+      else if (c === ")") depth--;
+      else if ((c === "+" || c === "-") && depth === 0 && i > 0) {
+        const before = t.slice(0, i).trimEnd();
+        if (/[0-9.][eE]$/.test(before) || /[*/^(,+-]$/.test(before)) continue;   // exponent sign / unary
+        return true;
+      }
+    }
+    return false;
+  }
+  // a width expression scaled so it evaluates to `want` (it is `cur` now):
+  // a plain number is replaced, "c*rest" gets a new coefficient, else "r*(expr)"
+  function rescaleExpr(expr, want, cur) {
+    const t = String(expr || "").trim();
+    if (!t || parseNum(t) !== null || !Number.isFinite(cur) || cur === 0) return fmtX(want);
+    const ratio = want / cur;
+    const m = /^([0-9.]+(?:[eE][+-]?\d+)?[pnuµμmkKMGT]?)\s*\*\s*(.+)$/.exec(t);
+    if (m && parseNum(m[1]) !== null && !topLevelAddSub(m[2])) return `${fmtR(parseNum(m[1]) * ratio)}*${m[2]}`;
+    return `${fmtR(ratio)}*(${t})`;
+  }
+  // a center expression shifted by `delta` (a trailing "+/- number" is updated)
+  function shiftExpr(expr, delta) {
+    const t = String(expr || "").trim();
+    if (!delta || !Number.isFinite(delta)) return t;
+    const n = parseNum(t);
+    if (n !== null) return fmtX(n + delta);
+    const m = /^(.*\S)\s*([+-])\s*([0-9.]+(?:[eE][+-]?\d+)?[pnuµμmkKMGT]?)$/.exec(t);
+    if (m && parseNum(m[3]) !== null && !/[*/^(,+-]$/.test(m[1])) {
+      const r = snapX((m[2] === "-" ? -1 : 1) * parseNum(m[3]) + delta);
+      return r === 0 ? m[1] : `${m[1]} ${r < 0 ? "-" : "+"} ${fmtE(Math.abs(r))}`;
+    }
+    const r = snapX(delta);
+    return r === 0 ? t : `${t} ${r < 0 ? "-" : "+"} ${fmtE(Math.abs(r))}`;
+  }
 
   function render() {
     form.innerHTML = "";
+    exprInputs = [];
     const def = S.def;
     const d = ds();
 
@@ -319,8 +465,6 @@ export function openBuilder(ctx, opts = {}) {
         b.onclick = () => {
           if (def.kind === k.id) return;
           const nd = k.id === "reduce" ? freshReduce() : D.newDef(k.id, S.file);
-          if (k.id === "combine") { const vs = numericVars(0); nd.a = vs[0] || ""; nd.b = vs[1] || vs[0] || ""; }
-          if (k.id === "transform") nd.src = defaultSource();
           nd.units = def.units; nd.description = def.description;
           S.def = nd; autoNames(); pickResultAxes(true); render();
         };
@@ -338,20 +482,20 @@ export function openBuilder(ctx, opts = {}) {
         const keep = { ...old, file: v };
         const vd = ds().vars[keep.src];
         S.def = vd ? D.canonicalDef(keep) : freshReduce();
-      } else S.def = D.newDef(old.kind, v);
+      } else S.def = D.canonicalDef({ ...old, file: v });
       autoNames(); pickResultAxes(true); render();
     }, { disabled: !!editing });
     sec0.appendChild(field("File", fsel, editing ? "a saved quantity stays on its file — use 'Copy recipe to' to put it on another file" : "the dataset to compute from"));
     form.appendChild(sec0);
 
     if (def.kind === "reduce") renderReduce(sec0, d, def);
-    else if (def.kind === "combine") renderCombine(sec0, d, def);
-    else renderTransform(sec0, d, def);
+    else renderFormula(sec0, d, def);
 
     // output
     const sec = h("div", { class: "sec" }, h("div", { class: "sec-t", text: "Result" }));
     const nameInp = h("input", { type: "text", value: S.names.main, placeholder: "name", maxlength: 64 });
     nameInp.oninput = () => { S.names.main = nameInp.value.trim(); S.nameTouched = true; schedule(); };
+    S._nameInps = { main: nameInp };
     if (S.preset === "snr" && def.kind === "reduce") {
       sec.appendChild(field("Peak name", nameInp, "name of the peak quantity"));
       const f1 = h("input", { type: "text", value: S.names.floor, maxlength: 64 });
@@ -360,21 +504,23 @@ export function openBuilder(ctx, opts = {}) {
       f2.oninput = () => { S.names.snr = f2.value.trim(); S.nameTouched = true; schedule(); };
       sec.appendChild(field("Floor name", f1));
       sec.appendChild(field("SNR name", f2, "SNR = peak − floor (dB for dB data)"));
+      S._nameInps.floor = f1; S._nameInps.snr = f2;
     } else {
       sec.appendChild(field("Name", nameInp, "letters, digits, space, _ . + - (max 64)"));
     }
-    let autoU = "";
-    try { autoU = D.autoUnits(d, { ...def, file: S.file }); } catch (e) { /* ignore */ }
-    const unitsInp = h("input", { type: "text", value: def.units || "", maxlength: 32,
-      placeholder: autoU ? `auto: ${autoU}` : "auto (none)" });
+    const unitsInp = h("input", { type: "text", value: def.units || "", maxlength: 32, placeholder: "auto" });
     unitsInp.oninput = () => { S.def.units = unitsInp.value; schedule(); };
+    S._unitsInp = unitsInp;
     sec.appendChild(field("Units", unitsInp, "blank = automatic from the source units"));
-    const descInp = h("input", { type: "text", value: def.description || "", maxlength: 200,
-      placeholder: D.describeDef(def) || "description" });
+    const descInp = h("input", { type: "text", value: def.description || "", maxlength: 200, placeholder: "description" });
     descInp.oninput = () => { S.def.description = descInp.value; };
+    S._descInp = descInp;
     sec.appendChild(field("Description", descInp, "free text (shown in the Info panel); blank = automatic"));
     form.appendChild(sec);
     form.appendChild(statusEl);
+    if (!exprInputs.some((e) => lastExpr && e.field === lastExpr.field)) lastExpr = null;
+    else { const e = exprInputs.find((q) => q.field === lastExpr.field); lastExpr = { inp: e.inp, field: e.field }; }
+    markTarget();
     schedule(true);
   }
 
@@ -390,7 +536,6 @@ export function openBuilder(ctx, opts = {}) {
     if (!v.dims.includes(def.over)) def.over = defaultOver(def.src);
     sec.appendChild(field("Reduce along", sel(v.dims.map((dim) => ({ id: dim, label: `${dim}  (${d.size(dim)})` })), def.over, (val) => {
       S.def.over = val; S.def.xsrc = D.suggestXsrc(d, S.def.src, val); S.slice = {};
-      if (S.def.window.mode === "relative" && !D.centerSourceOptions(d, S.def.src, val).includes(S.def.window.center)) S.def.window.mode = "none";
       autoNames(); pickResultAxes(true); render();
     }), "the dimension that is collapsed — usually the spectrum's frequency-bin dimension"));
     const xs = D.xSourceOptions(d, def.src, def.over);
@@ -399,60 +544,60 @@ export function openBuilder(ctx, opts = {}) {
       "the x value of each point — the window is defined in these units (e.g. a per-spectrum frequency array)"));
     const xu = (() => { const n = def.xsrc === "coord" ? def.over : (def.xsrc.startsWith("var:") ? def.xsrc.slice(4) : null); return n && d.vars[n] ? X.unitsOf(d.vars[n]) : ""; })();
 
-    // window
+    // window: every bound is an expression of the names in the picker
     const w = def.window;
+    const tw = () => S.def.window;
     const sw = h("div", { class: "sec" }, h("div", { class: "sec-t", text: "Window" + (xu ? ` (x in ${xu})` : "") }));
     sw.appendChild(field("Window", sel(D.WINDOW_MODES, w.mode, (val) => {
-      if (val === "relative" && !w.center) { setupWindow(S.def, true); if (S.def.window.mode !== "relative") { S.def.window.mode = "relative"; S.def.window.center = D.centerSourceOptions(d, def.src, def.over)[0] || ""; } }
-      else if (val === "fixed" && (w.lo == null || w.hi == null)) setupWindow(S.def, false);
+      if (val === "center" && !String(w.center || "").trim()) {
+        setupWindow(S.def, true);
+        if (S.def.window.mode !== "center") {
+          const nm = (D.windowNames(d, def.src, def.over)[0] || {}).name;
+          S.def.window.center = nm ? quoteName(nm) : "";
+          if (!String(S.def.window.halfwidth || "").trim()) S.def.window.halfwidth = "1";
+        }
+      } else if (val === "range" && !(String(w.lo || "").trim() && String(w.hi || "").trim())) setupWindow(S.def, false);
       S.def.window.mode = val;
       if (val === "none") S.def.region = "inside";
-      autoNames(); pickResultAxes(); render();
+      autoNames(); pickResultAxes(true); render();
     }), "which x values are used"));
-    if (w.mode === "fixed") {
-      const r = h("div", { class: "row" },
-        field("from", numInput(w.lo, (x) => { S.def.window.lo = x; }, "lo")),
-        field("to", numInput(w.hi, (x) => { S.def.window.hi = x; }, "hi")));
-      r.querySelectorAll("span.lt").forEach((s) => { s.style.width = "auto"; });
-      sw.appendChild(r);
-    } else if (w.mode === "relative") {
-      const cs = D.centerSourceOptions(d, def.src, def.over);
-      sw.appendChild(field("Centered on", sel(cs.map((c) => ({ id: c, label: centerLabel(d, c) })), w.center, (val) => {
-        S.def.window.center = val; pickResultAxes(true); render();
-      }), "a coordinate or variable that shares the remaining dimensions (e.g. the stimulus frequency)"));
-      const r = h("div", { class: "row" },
-        field("× k", numInput(w.k, (x) => { S.def.window.k = x == null ? 1 : x; }, "1", "harmonic number: the window center is k × center + offset")),
-        field("+ offset", numInput(w.offset, (x) => { S.def.window.offset = x == null ? 0 : x; }, "0", "shift of the window center (x units; SI suffixes ok)")));
-      r.querySelectorAll("span.lt").forEach((s) => { s.style.width = "auto"; });
-      sw.appendChild(r);
-      sw.appendChild(field("± half width", numInput(w.halfwidth, (x) => { S.def.window.halfwidth = x; }, "e.g. 5k"),
-        "the window is center ± this (x units)"));
+    if (w.mode === "range") {
+      sw.append(...exprInput("lo", "from", "e.g. 0.9*stimulusFrequency", "lower edge (x units)", tw));
+      sw.append(...exprInput("hi", "to", "e.g. 1.1*stimulusFrequency", "upper edge (x units)", tw));
+    } else if (w.mode === "center") {
+      sw.append(...exprInput("center", "center", "e.g. stimulusFrequency or 2*stimulusFrequency",
+        "the window center (x units) — e.g. the stimulus frequency, a harmonic k*f, plus an offset", tw));
+      sw.append(...exprInput("halfwidth", "± half width", "e.g. 0.01*stimulusFrequency or 3*ResolutionBWs",
+        "the window is center ± this (x units); it can follow other quantities", tw));
     }
     if (w.mode !== "none") {
-      sw.appendChild(field("Use points", sel(D.REGIONS, def.region, (val) => {
-        if (val === "outside_within") {
-          if (w.mode === "fixed" && (w.lo2 == null || w.hi2 == null)) {
-            const span = (w.hi ?? 0) - (w.lo ?? 0);
-            S.def.window.lo2 = (w.lo ?? 0) - 3 * Math.abs(span || 1); S.def.window.hi2 = (w.hi ?? 0) + 3 * Math.abs(span || 1);
+      const outerDefault = () => {
+        const p = S._p;
+        if (w.mode === "range" && !(String(w.lo2 || "").trim() && String(w.hi2 || "").trim())) {
+          const lo = p && p.inner ? p.inner[0] : D.exprValueAt(d, S.def, "lo", S.slice);
+          const hi = p && p.inner ? p.inner[1] : D.exprValueAt(d, S.def, "hi", S.slice);
+          if (Number.isFinite(lo) && Number.isFinite(hi)) {
+            const span = Math.abs(hi - lo) || 1;
+            S.def.window.lo2 = fmtE(Math.min(lo, hi) - 3 * span); S.def.window.hi2 = fmtE(Math.max(lo, hi) + 3 * span);
           }
-          if (w.mode === "relative" && w.halfwidth2 == null) S.def.window.halfwidth2 = Math.abs(w.halfwidth || 1) * 5;
         }
+        if (w.mode === "center" && !String(w.halfwidth2 || "").trim()) {
+          const cur = p && p.inner ? (p.inner[1] - p.inner[0]) / 2 : NaN;
+          S.def.window.halfwidth2 = rescaleExpr(w.halfwidth, 5 * cur, cur);
+        }
+      };
+      sw.appendChild(field("Use points", sel(D.REGIONS, def.region, (val) => {
+        if (val === "outside_within") outerDefault();
         set("region", val);
       }), "inside the window (e.g. the tone), outside it (e.g. the noise floor), or outside it but within a wider span"));
-      if (def.region === "outside_within") {
-        if (w.mode === "fixed") {
-          const r = h("div", { class: "row" },
-            field("outer from", numInput(w.lo2, (x) => { S.def.window.lo2 = x; }, "lo2")),
-            field("to", numInput(w.hi2, (x) => { S.def.window.hi2 = x; }, "hi2")));
-          r.querySelectorAll("span.lt").forEach((s) => { s.style.width = "auto"; });
-          sw.appendChild(r);
-        } else {
-          sw.appendChild(field("outer ± half width", numInput(w.halfwidth2, (x) => { S.def.window.halfwidth2 = x; }, "e.g. 50k"),
-            "points farther than this from the center are ignored"));
-        }
-      }
+      S._outerDefault = outerDefault;
+      if (def.region === "outside_within") appendOuter(sw, w);
+      sw.appendChild(picker(D.windowNames(d, def.src, def.over), "window"));
+      sw.appendChild(note("Each expression is evaluated <b>per spectrum</b>: a name stands for its value for the spectrum being reduced "
+        + "(e.g. <code>stimulusFrequency</code>, <code>ResolutionBWs</code>). Drag across the preview to set the window; drag the band or its edges to adjust it."));
+    } else {
+      sw.appendChild(note("Tip: drag across the spectrum preview to set a window."));
     }
-    sw.appendChild(note("Tip: drag across the spectrum preview to set the window; drag the shaded band or its edges to adjust it."));
     form.appendChild(sw);
 
     // statistic
@@ -463,23 +608,10 @@ export function openBuilder(ctx, opts = {}) {
         (val) => { S.floorStat = val; schedule(); })));
       st.appendChild(field("Floor points", sel(D.REGIONS.filter((r) => r.id !== "inside"), S.floorRegion, (val) => {
         S.floorRegion = val;
-        if (val === "outside_within") {
-          if (w.mode === "fixed" && (w.lo2 == null || w.hi2 == null)) { const span = (w.hi ?? 0) - (w.lo ?? 0); S.def.window.lo2 = (w.lo ?? 0) - 3 * Math.abs(span || 1); S.def.window.hi2 = (w.hi ?? 0) + 3 * Math.abs(span || 1); }
-          if (w.mode === "relative" && w.halfwidth2 == null) S.def.window.halfwidth2 = Math.abs(w.halfwidth || 1) * 5;
-        }
+        if (val === "outside_within" && S._outerDefault) S._outerDefault();
         render();
       })));
-      if (S.floorRegion === "outside_within" && w.mode !== "none") {
-        if (w.mode === "fixed") {
-          const r = h("div", { class: "row" },
-            field("outer from", numInput(w.lo2, (x) => { S.def.window.lo2 = x; }, "lo2")),
-            field("to", numInput(w.hi2, (x) => { S.def.window.hi2 = x; }, "hi2")));
-          r.querySelectorAll("span.lt").forEach((s) => { s.style.width = "auto"; });
-          st.appendChild(r);
-        } else {
-          st.appendChild(field("outer ± half width", numInput(w.halfwidth2, (x) => { S.def.window.halfwidth2 = x; }, "e.g. 50k")));
-        }
-      }
+      if (S.floorRegion === "outside_within" && w.mode !== "none") appendOuter(st, w);
     } else {
       const sSel = sel(D.STATS, def.stat, (val) => set("stat", val));
       st.appendChild(field("Statistic", sSel, (D.STATS.find((s) => s.id === def.stat) || {}).hint));
@@ -495,53 +627,74 @@ export function openBuilder(ctx, opts = {}) {
     form.appendChild(st);
   }
 
-  function renderCombine(sec, d, def) {
-    const vars = numericVars(0);
-    if (!vars.length) { sec.appendChild(note("No numeric variables in this file.", "err")); return; }
-    if (!vars.includes(def.a)) def.a = vars[0];
-    const lab = (n) => ({ id: n, label: `${n}  (${d.vars[n].dims.join(", ") || "scalar"})` });
-    sec.appendChild(field("a", sel(vars.map(lab), def.a, (val) => set("a", val))));
-    sec.appendChild(field("Operation", sel(D.OPS, def.op, (val) => set("op", val))));
-    const isNum = typeof def.b === "number";
-    const kindSel = sel([{ id: "var", label: "a variable" }, { id: "num", label: "a number" }], isNum ? "num" : "var", (val) => {
-      S.def.b = val === "num" ? 0 : (vars[1] || vars[0]); autoNames(); pickResultAxes(); render();
+  // the outer span of "outside, within outer span" (range: two bounds; center: a half width)
+  function appendOuter(box, w) {
+    const tw = () => S.def.window;
+    if (w.mode === "range") {
+      box.append(...exprInput("lo2", "outer from", "e.g. 0.5*stimulusFrequency", "points below this are ignored", tw));
+      box.append(...exprInput("hi2", "outer to", "e.g. 1.5*stimulusFrequency", "points above this are ignored", tw));
+    } else {
+      box.append(...exprInput("halfwidth2", "outer ± half width", "e.g. 0.1*stimulusFrequency",
+        "points farther than this from the center are ignored", tw));
+    }
+  }
+
+  function renderFormula(sec, d, def) {
+    sec.append(...exprInput("expr", "Formula", "e.g. peak - floor  ·  floor - 10*log10(ResolutionBWs)",
+      "an expression of the variables of this file, computed element by element", () => S.def));
+    sec.appendChild(picker(D.formulaNames(d).filter((n) => !forbidden().has(n.name)), "formula"));
+    sec.appendChild(note("Variables are matched by <b>dimension name</b>: the result has every dimension of the variables "
+      + "it uses (e.g. <code>spectrums - spectrums_peak</code> normalizes each spectrum to its own peak). "
+      + "Units are worked out automatically (dBm − dBm → dB)."));
+  }
+
+  // live check of every expression box + the value it takes at the previewed slice
+  function refreshExprBoxes(defs) {
+    const d = ds();
+    for (const e of exprInputs) {
+      // the floor of the SNR preset is the def that needs the outer span
+      const owner = defs.length === 3 && ["lo2", "hi2", "halfwidth2"].includes(e.field) ? defs[1] : defs[0];
+      let err = null;
+      try { err = D.exprError(d, owner, e.field); } catch (x) { err = x.message; }
+      e.inp.classList.toggle("bad", !!err);
+      e.err.hidden = !err;
+      e.err.textContent = err ? "⚠ " + err : "";
+      e.val.textContent = "";
+      if (!err && e.field !== "expr" && String(e.inp.value).trim()) {
+        let v = NaN;
+        try { v = D.exprValueAt(d, owner, e.field, S.slice); } catch (x) { v = NaN; }
+        e.val.textContent = Number.isFinite(v) ? "= " + fmtSI(parseFloat(v.toPrecision(5))) : "= NaN";
+      }
+    }
+  }
+
+  function showExprHelp(what) {
+    const fns = D.FUNCTIONS.map((f) => `<tr><td><code>${f.sig}</code></td><td>${f.doc}</td></tr>`).join("");
+    modal({
+      title: "Expressions — syntax",
+      body: h("div", { class: "expr-help", html: `
+        <p>${what === "window"
+          ? "Window expressions are evaluated <b>for every spectrum</b> (every index of the remaining dimensions): a name stands for its value for that spectrum. Usable names: the remaining dimensions (their coordinate, or the index when there is none) and the variables that depend only on them."
+          : "A formula is computed element by element. Variables are matched by <b>dimension name</b>; the result has every dimension of the variables it uses."}</p>
+        <h4>Examples</h4>
+        <pre class="code">stimulusFrequency                  center on the stimulus
+2*stimulusFrequency + 5k           2nd harmonic, shifted by 5 kHz
+0.01*stimulusFrequency             half width = 1 % of the stimulus frequency
+3*ResolutionBWs                    half width = 3 × the RBW used for that spectrum
+peak - floor                       SNR (dB) from two derived quantities
+floor - 10*log10(ResolutionBWs)    noise floor normalized to 1 Hz (dBm/Hz)</pre>
+        <h4>Syntax</h4>
+        <table class="kv">
+          <tr><td><code>+ - * /</code></td><td>arithmetic; <code>^</code> (or <code>**</code>) power; parentheses</td></tr>
+          <tr><td><code>5k 1.5M 2G 10m 3u 2e-3</code></td><td>numbers with SI suffixes p n u (µ) m k M G T, or exponents</td></tr>
+          <tr><td><code>"my var"</code></td><td>quote names with spaces or other characters</td></tr>
+          <tr><td><code>pi</code></td><td>π</td></tr>
+          ${fns}
+        </table>
+        <p class="hint">NaN propagates; a result that is not a finite number becomes NaN. A window whose bounds are not finite numbers
+        for some spectrum uses no points there (the result is NaN).</p>` }),
+      buttons: [{ spacer: true }, { label: "Close", kind: "primary", id: "ok" }],
     });
-    sec.appendChild(field("b is", kindSel));
-    if (isNum) sec.appendChild(field("b", numInput(def.b, (x) => { S.def.b = x == null ? 0 : x; autoNames(); }, "0")));
-    else {
-      if (!vars.includes(def.b)) def.b = vars[1] || vars[0];
-      sec.appendChild(field("b", sel(vars.map(lab), def.b, (val) => set("b", val))));
-    }
-    sec.appendChild(note("Dimensions are matched by name; the result has all of a's dimensions plus any extra ones of b. "
-      + "Example: SNR = peak − floor; or normalize each spectrum: spectrum − (its peak)."));
-  }
-
-  function renderTransform(sec, d, def) {
-    const vars = numericVars(0);
-    if (!vars.length) { sec.appendChild(note("No numeric variables in this file.", "err")); return; }
-    if (!vars.includes(def.src)) def.src = vars[0];
-    sec.appendChild(field("Source", sel(vars.map((n) => ({ id: n, label: `${n}  (${d.vars[n].dims.join(", ") || "scalar"})` })), def.src, (val) => set("src", val))));
-    sec.appendChild(field("Function", sel(D.TRANSFORMS, def.fn, (val) => set("fn", val))));
-    if (def.fn === "scale") {
-      const r = h("div", { class: "row" },
-        field("a", numInput(def.scale, (x) => { S.def.scale = x == null ? 1 : x; }, "1")),
-        field("b", numInput(def.offset, (x) => { S.def.offset = x == null ? 0 : x; }, "0")));
-      r.querySelectorAll("span.lt").forEach((s) => { s.style.width = "auto"; });
-      sec.appendChild(r);
-    }
-  }
-
-  function centerLabel(d, c) {
-    if (c.startsWith("coord:")) {
-      const dim = c.slice(6);
-      const cv = d.vars[dim];
-      const u = cv ? X.unitsOf(cv) : "";
-      let ex = "";
-      if (cv && cv.data && cv.data.length) ex = ` = ${X.fmt6(Number(cv.data[0]))}${cv.data.length > 1 ? ", …" : ""}`;
-      return `${dim} (coordinate${u ? ", " + u : ""})${ex}`;
-    }
-    const n = c.slice(4); const cv = d.vars[n];
-    return `${n}${cv && X.unitsOf(cv) ? ` (${X.unitsOf(cv)})` : ""}`;
   }
 
   // ---------------------------------------------------------------- preview
@@ -569,7 +722,7 @@ export function openBuilder(ctx, opts = {}) {
     const d = ds();
     const out = [];
     for (const q of defs) {
-      if (q.kind === "combine" && out.length === 2 && q.a === defs[0].name && q.b === defs[1].name) {
+      if (q.kind === "formula" && out.length === 2 && S.preset === "snr" && defs.length === 3) {
         const a = out[0].res, b = out[1].res;
         const data = new Float64Array(a.data.length);
         for (let i = 0; i < data.length; i++) { const v = a.data[i] - b.data[i]; data[i] = Number.isFinite(v) ? v : NaN; }
@@ -598,6 +751,14 @@ export function openBuilder(ctx, opts = {}) {
       const u = r.attrs.units ? ` · units ${r.attrs.units}` : "";
       statusEl.textContent = (nameErr ? `⚠ ${nameErr} — ` : "✓ ") + `result: ${dimsTxt} (${r.data.length} value${r.data.length === 1 ? "" : "s"})${u}`;
     }
+    refreshExprBoxes(defs);
+    // automatic names follow the definition until the user types one
+    if (!S.nameTouched && S._nameInps)
+      for (const [k, el] of Object.entries(S._nameInps)) if (el && el.value !== S.names[k]) el.value = S.names[k];
+    let autoU = "";
+    try { autoU = D.autoUnits(d, defs[0]); } catch (e) { /* ignore */ }
+    if (S._unitsInp) S._unitsInp.placeholder = autoU ? `auto: ${autoU}` : "auto (none)";
+    if (S._descInp) { let ds0 = ""; try { ds0 = D.describeDef(defs[0]); } catch (e) { /* ignore */ } S._descInp.placeholder = ds0 || "description"; }
     m.button("save").disabled = !!(err || nameErr);
     m.button("saveplot").disabled = !!(err || nameErr) || !res || res[0].res.dims.length === 0;
     drawSourcePreview(defs, err);
@@ -612,8 +773,8 @@ export function openBuilder(ctx, opts = {}) {
     pvHead.innerHTML = "";
     pvSliders.innerHTML = "";
     if (def.kind !== "reduce") {
-      pvHead.append(h("span", { class: "bp-title", text: "Source" }),
-        h("span", { class: "bp-stat", text: def.kind === "combine" ? "elementwise: " + D.describeDef(def) : D.describeDef(def) }));
+      pvHead.append(h("span", { class: "bp-title", text: "Formula" }),
+        h("span", { class: "bp-stat", text: (def.expr || "").trim() ? `${def.name || "result"} = ${def.expr}` : "type an expression" }));
       pvPlot.style.display = "none";
       return;
     }
@@ -733,32 +894,32 @@ export function openBuilder(ctx, opts = {}) {
     S._p = p;
   }
 
-  // window edits from the plot -> the def
+  // window edits from the plot -> the def (expressions are edited, not replaced,
+  // where that keeps their meaning: "0.01*f" -> "0.02*f", "f + 5k" -> "f + 7k")
   function setWindowFromRange(x0, x1, role) {
     const w = S.def.window;
     const lo = Math.min(x0, x1), hi = Math.max(x0, x1);
     if (!Number.isFinite(lo) || !Number.isFinite(hi)) return;
     const p = S._p;
     if (w.mode === "none") {
-      // a drag on a whole-span window creates a fixed one
-      S.def.window.mode = "fixed"; S.def.window.lo = lo; S.def.window.hi = hi;
-      if (S.preset !== "floor" && S.def.region === "inside") { /* keep */ }
-    } else if (w.mode === "fixed") {
-      if (role === "outer") { w.lo2 = lo; w.hi2 = hi; } else { w.lo = lo; w.hi = hi; }
+      // a drag on a whole-span window creates a range
+      w.mode = "range"; w.lo = fmtX(lo); w.hi = fmtX(hi);
+    } else if (w.mode === "range") {
+      if (role === "outer") { w.lo2 = fmtX(lo); w.hi2 = fmtX(hi); } else { w.lo = fmtX(lo); w.hi = fmtX(hi); }
     } else {
-      const k = Number.isFinite(w.k) ? w.k : 1, off = Number.isFinite(w.offset) ? w.offset : 0;
       const center = p && Number.isFinite(p.center) ? p.center : (lo + hi) / 2;
-      const c = k !== 0 ? (center - off) / k : 0;              // the raw center value
       if (role === "outer") {
-        w.halfwidth2 = nice3(Math.max(Math.abs(lo - center), Math.abs(hi - center)));
+        const cur = p && p.outer ? (p.outer[1] - p.outer[0]) / 2 : NaN;
+        w.halfwidth2 = rescaleExpr(w.halfwidth2, Math.max(Math.abs(lo - center), Math.abs(hi - center)), cur);
       } else if (role === "center") {
-        w.offset = nice3((lo + hi) / 2 - k * c);
+        w.center = shiftExpr(w.center, (lo + hi) / 2 - center);
       } else {
         // a drag roughly centered on the current center only sets the width;
-        // an off-center one also shifts the window (offset)
+        // an off-center one (or moving the band) also shifts the center
         const mid = (lo + hi) / 2, hw = (hi - lo) / 2;
-        w.halfwidth = nice3(hw);
-        if (Math.abs(mid - center) > 0.25 * hw || role === "drag-move") w.offset = nice3(mid - k * c);
+        const cur = p && p.inner ? (p.inner[1] - p.inner[0]) / 2 : NaN;
+        if (role !== "drag-move") w.halfwidth = rescaleExpr(w.halfwidth, hw, cur);
+        if (Math.abs(mid - center) > 0.25 * hw || role === "drag-move") w.center = shiftExpr(w.center, mid - center);
       }
     }
     render();
@@ -909,15 +1070,16 @@ export function openBuilder(ctx, opts = {}) {
         <p>A <b>window statistic</b> collapses one dimension of a variable (e.g. the frequency bins of a stack of
         spectra) into one number per remaining index — e.g. the <b>peak power</b> near the stimulus frequency for every
         stimulus frequency and amplitude.</p>
-        <p>The <b>window</b> is in the units of the chosen <b>X values</b>. It can be <i>fixed</i> (from … to …) or
-        <i>relative</i>: centered on a coordinate or variable that shares the remaining dimensions, times <i>k</i> (harmonics)
-        plus an offset, ± a half width. <i>Use points</i> picks the points inside it, outside it (the noise floor), or
-        outside it but within a wider span.</p>
+        <p>The <b>window</b> is in the units of the chosen <b>X values</b>: <i>from … to …</i>, or <i>center ± half width</i>.
+        Every bound is an <b>expression</b> evaluated for each spectrum — e.g. center <code>stimulusFrequency</code> (or
+        <code>2*stimulusFrequency</code> for the 2nd harmonic) with half width <code>0.01*stimulusFrequency</code> or
+        <code>3*ResolutionBWs</code>. Click a name under the fields to insert it. <i>Use points</i> picks the points inside the
+        window, outside it (the noise floor), or outside it but within a wider span.</p>
         <p><b>dB data</b> (units containing “dB”) are averaged in <b>linear power</b>: mean, median, std, sum and integral
         convert 10^(x/10), compute, and convert back to dB (averaging in dB would bias Gaussian noise low by ≈2.5 dB).
         Max/min/argmax are unaffected. NaNs and empty windows are ignored (an empty window gives NaN).</p>
-        <p><b>Combine</b> computes a ∘ b elementwise, matching dimensions by name (SNR = peak − floor). <b>Transform</b>
-        converts dB ↔ linear or applies a·x + b.</p>
+        <p>A <b>formula</b> computes any expression of variables element by element, matching dimensions by name — e.g.
+        <code>peak - floor</code> (SNR) or <code>floor - 10*log10(ResolutionBWs)</code> (noise in dBm/Hz).</p>
         <p>Derived quantities are saved in the project, recomputed when it loads, reproduced by the Python report
         script, and can be copied to another file with the same structure (right-click → Copy recipe to).</p>` }),
       buttons: [{ spacer: true }, { label: "Close", kind: "primary", id: "ok" }],

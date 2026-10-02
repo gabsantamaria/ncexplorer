@@ -635,13 +635,8 @@ function renameRefs(file, oldName, newName) {
     if (t.xsrc === "var:" + oldName) t.xsrc = "var:" + newName;
     if (t.ssrc === "var:" + oldName) t.ssrc = "var:" + newName;
   }
-  for (const d of state.derived) {
-    if (d.file !== file) continue;
-    for (const k of ["src", "a"]) if (d[k] === oldName) d[k] = newName;
-    if (d.b === oldName) d.b = newName;
-    if (d.xsrc === "var:" + oldName) d.xsrc = "var:" + newName;
-    if (d.window && d.window.center === "var:" + oldName) d.window.center = "var:" + newName;
-  }
+  // other definitions: source fields and names inside window / formula expressions
+  for (const d of state.derived) if (d.file === file) D.renameRef(d, oldName, newName);
 }
 
 // save defs from the builder. `replace` = {file, name} of the def being edited.
@@ -2091,9 +2086,11 @@ function showHelp() {
       + "and use the <b>sliders</b> to scrub the remaining dimensions." }),
     h("p", { html: "<b>ƒ Derived…</b> turns a stack of spectra into a processed quantity: e.g. the <i>peak power</i> in a "
       + "window around the stimulus frequency, the <i>noise floor</i> outside it, and their difference (SNR), "
-      + "each vs the remaining dimensions. Statistics of dB data (mean, median, std, sum, integral) are computed "
-      + "in linear power. Derived quantities appear in the tree with a <span class=\"badge fx\">ƒ</span> badge and plot "
-      + "like any variable; right-click one to edit it or copy its recipe to another file." }),
+      + "each vs the remaining dimensions. Window bounds are <b>expressions</b> evaluated per spectrum, e.g. "
+      + "<code>stimulusFrequency ± 0.01*stimulusFrequency</code> or <code>± 3*ResolutionBWs</code>; a <b>formula</b> "
+      + "combines variables (<code>peak - floor</code>). Statistics of dB data (mean, median, std, sum, integral) are "
+      + "computed in linear power. Derived quantities appear in the tree with a <span class=\"badge fx\">ƒ</span> badge "
+      + "and plot like any variable; right-click one to edit it or copy its recipe to another file." }),
     h("p", { html: "<b>Tabs</b> are independent plots that share the datasets. <b>Save</b> writes everything (tabs, "
       + "traces, derived quantities, cosmetics, markers) to a .ncproj; your session is also auto-saved in this browser. "
       + "<b>Report ▾</b> makes a multi-page vector PDF of several tabs, or downloads a Python script that regenerates "
